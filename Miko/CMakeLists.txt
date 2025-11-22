@@ -28,13 +28,13 @@ set(PICO_BOARD pico CACHE STRING "Board type")
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
-# Include pico-tflmicro
-include(../pico-tflmicro/pico_tflmicro_import.cmake)
-
 project(Miko C CXX ASM)
 
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
+
+# Add pico-tflmicro library (custom wrapper to avoid SDK re-initialization)
+include(pico_tflmicro.cmake)
 
 # Add executable. Default name is the project name, version 0.1
 
@@ -45,6 +45,13 @@ add_executable(Miko
 
 pico_set_program_name(Miko "Miko")
 pico_set_program_version(Miko "0.1")
+
+# Set compiler flags for TensorFlow Lite compatibility
+set_target_properties(
+    Miko
+    PROPERTIES
+    COMPILE_FLAGS "-fno-rtti -fno-exceptions -fno-threadsafe-statics"
+)
 
 # Modify the below lines to enable/disable output over UART/USB
 pico_enable_stdio_uart(Miko 0)
