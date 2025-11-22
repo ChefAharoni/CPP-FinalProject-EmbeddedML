@@ -36,5 +36,21 @@
     "raspberry-pi-pico.cmakeAutoConfigure": false,
     "raspberry-pi-pico.useCmakeTools": true,
     "raspberry-pi-pico.cmakePath": "${HOME}/.pico-sdk/cmake/v3.31.5/bin/cmake",
-    "raspberry-pi-pico.ninjaPath": "${HOME}/.pico-sdk/ninja/v1.12.1/ninja"
+    "raspberry-pi-pico.ninjaPath": "${HOME}/.pico-sdk/ninja/v1.12.1/ninja",
+    "cmake.configureEnvironment": {
+        "PICO_SDK_PATH": "${env:HOME}/.pico-sdk/sdk/2.2.0",
+        "PICO_TOOLCHAIN_PATH": "${env:HOME}/.pico-sdk/toolchain/14_2_Rel1"
+    },
+    "cmake.environment": {
+        "PICO_SDK_PATH": "${env:HOME}/.pico-sdk/sdk/2.2.0",
+        "PICO_TOOLCHAIN_PATH": "${env:HOME}/.pico-sdk/toolchain/14_2_Rel1"
+    },
+    "cmake.buildDirectory": "${workspaceFolder}/build",
+    "cmake.preferredGenerators": [
+        "Ninja"
+    ],
+    "cmake.configureArgs": [
+        "-DCMAKE_C_COMPILER=${env:HOME}/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-gcc",
+        "-DCMAKE_CXX_COMPILER=${env:HOME}/.pico-sdk/toolchain/14_2_Rel1/bin/arm-none-eabi-g++"
+    ]
 }
