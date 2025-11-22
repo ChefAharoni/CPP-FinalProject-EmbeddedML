@@ -28,6 +28,9 @@ set(PICO_BOARD pico CACHE STRING "Board type")
 # Pull in Raspberry Pi Pico SDK (must be before project)
 include(pico_sdk_import.cmake)
 
+# Include pico-tflmicro
+include(../pico-tflmicro/pico_tflmicro_import.cmake)
+
 project(Miko C CXX ASM)
 
 # Initialise the Raspberry Pi Pico SDK
@@ -35,7 +38,10 @@ pico_sdk_init()
 
 # Add executable. Default name is the project name, version 0.1
 
-add_executable(Miko Miko.c )
+add_executable(Miko
+    Miko.cpp
+    model_data.cc
+)
 
 pico_set_program_name(Miko "Miko")
 pico_set_program_version(Miko "0.1")
@@ -46,7 +52,8 @@ pico_enable_stdio_usb(Miko 1)
 
 # Add the standard library to the build
 target_link_libraries(Miko
-        pico_stdlib)
+        pico_stdlib
+        pico-tflmicro)
 
 # Add the standard include files to the build
 target_include_directories(Miko PRIVATE
