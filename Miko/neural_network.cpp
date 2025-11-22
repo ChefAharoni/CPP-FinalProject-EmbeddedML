@@ -100,11 +100,11 @@ void MatrixOps::dense_forward(
 // ============================================================================
 
 NeuralNetwork::NeuralNetwork(
-    const float (*l1_weights)[18],
+    const float* l1_weights,
     const float* l1_bias,
     size_t l1_in,
     size_t l1_out,
-    const float (*l2_weights)[3],
+    const float* l2_weights,
     const float* l2_bias,
     size_t l2_in,
     size_t l2_out
@@ -124,11 +124,10 @@ NeuralNetwork::NeuralNetwork(
 }
 
 void NeuralNetwork::predict(const float* input, float* output) {
-    // Layer 1: Dense(18) + ReLU
-    // input[2] -> layer1_output[18]
+    // Layer 1: Dense + ReLU
     MatrixOps::dense_forward(
         input,
-        reinterpret_cast<const float*>(layer1_weights_),
+        layer1_weights_,
         layer1_bias_,
         layer1_output_,
         layer1_input_size_,
@@ -138,11 +137,10 @@ void NeuralNetwork::predict(const float* input, float* output) {
     // Apply ReLU activation
     Activation::relu(layer1_output_, layer1_output_size_);
 
-    // Layer 2: Dense(3) + Softmax
-    // layer1_output[18] -> output[3]
+    // Layer 2: Dense + Softmax
     MatrixOps::dense_forward(
         layer1_output_,
-        reinterpret_cast<const float*>(layer2_weights_),
+        layer2_weights_,
         layer2_bias_,
         output,
         layer2_input_size_,

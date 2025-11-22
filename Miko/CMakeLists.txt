@@ -41,6 +41,7 @@ pico_sdk_init()
 add_executable(Miko
     Miko.cpp
     neural_network.cpp
+    temp_sensor.cpp
 )
 
 pico_set_program_name(Miko "Miko")
@@ -57,9 +58,10 @@ set_target_properties(
 pico_enable_stdio_uart(Miko 0)
 pico_enable_stdio_usb(Miko 1)
 
-# Link only the Pico standard library (no TensorFlow Lite or external ML libraries)
+# Link libraries: Pico standard library + hardware ADC for temperature sensor
 target_link_libraries(Miko
     pico_stdlib
+    hardware_adc
 )
 
 # Add include directories

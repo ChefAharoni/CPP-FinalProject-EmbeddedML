@@ -79,39 +79,39 @@ public:
  */
 class NeuralNetwork {
 private:
-    // Layer 1: Dense(18, ReLU)
-    const float (*layer1_weights_)[18];  // [2][18]
-    const float* layer1_bias_;            // [18]
+    // Layer 1: Dense layer with ReLU
+    const float* layer1_weights_;  // Stored as 1D array: [input_size * output_size]
+    const float* layer1_bias_;     // [output_size]
     size_t layer1_input_size_;
     size_t layer1_output_size_;
 
-    // Layer 2: Dense(3, Softmax)
-    const float (*layer2_weights_)[3];   // [18][3]
-    const float* layer2_bias_;            // [3]
+    // Layer 2: Dense layer with Softmax
+    const float* layer2_weights_;  // Stored as 1D array: [input_size * output_size]
+    const float* layer2_bias_;     // [output_size]
     size_t layer2_input_size_;
     size_t layer2_output_size_;
 
-    // Intermediate buffers for layer outputs
+    // Intermediate buffers for layer outputs (max size: 18 for compatibility)
     float layer1_output_[18];  // Output of layer 1 (after ReLU)
 
 public:
     /**
      * Constructor
-     * @param l1_weights Layer 1 weights [input_size][hidden_size]
+     * @param l1_weights Layer 1 weights as 1D array [input_size * hidden_size]
      * @param l1_bias Layer 1 bias [hidden_size]
      * @param l1_in Layer 1 input size
      * @param l1_out Layer 1 output size
-     * @param l2_weights Layer 2 weights [hidden_size][output_size]
+     * @param l2_weights Layer 2 weights as 1D array [hidden_size * output_size]
      * @param l2_bias Layer 2 bias [output_size]
      * @param l2_in Layer 2 input size
      * @param l2_out Layer 2 output size
      */
     NeuralNetwork(
-        const float (*l1_weights)[18],
+        const float* l1_weights,
         const float* l1_bias,
         size_t l1_in,
         size_t l1_out,
-        const float (*l2_weights)[3],
+        const float* l2_weights,
         const float* l2_bias,
         size_t l2_in,
         size_t l2_out
