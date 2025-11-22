@@ -2,3 +2,4 @@ pico_ml
 *.o
 .DS_Store
 */.DS_Store
+scripts/model.tflite
