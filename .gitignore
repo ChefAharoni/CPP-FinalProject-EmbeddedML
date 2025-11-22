@@ -5,4 +5,13 @@ pico_ml
 venvMikoENV/
 .vscode/settings.json
 pico/pico-examples
-
+build/
+/build
+Miko/.cache/clangd/index/Miko_custom.cpp.29296C212AEB7CA5.idx
+Miko/.cache/clangd/index/Miko.cpp.51194CC14970D4AA.idx
+Miko/.cache/clangd/index/model_data.cc.7999F72BB6AC8B6A.idx
+Miko/.cache/clangd/index/model_data.h.AB207D145BC3042A.idx
+Miko/.cache/clangd/index/model_weights.h.69CA51A5CAEFA8FD.idx
+Miko/.cache/clangd/index/neural_network.cpp.3D3EBF828493ED48.idx
+Miko/.cache/clangd/index/neural_network.h.B70FF6ED2905F5F8.idx
+pico/pico-examples
