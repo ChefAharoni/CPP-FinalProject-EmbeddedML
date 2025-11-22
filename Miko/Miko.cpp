@@ -1,120 +1,92 @@
+/**
+ * Miko - Custom Neural Network Inference Demo
+ * Uses custom C++ implementation instead of TensorFlow Lite
+ *
+ * Model: Gaussian Blob Classification
+ * Architecture: Input(2) -> Dense(18, ReLU) -> Dense(3, Softmax)
+ */
+
 #include <stdio.h>
 #include "pico/stdlib.h"
-#include "tensorflow/lite/micro/micro_mutable_op_resolver.h"
-#include "tensorflow/lite/micro/micro_interpreter.h"
-#include "tensorflow/lite/micro/system_setup.h"
-#include "tensorflow/lite/schema/schema_generated.h"
-#include "model_data.h"
+#include "neural_network.h"
+#include "model_weights.h"
 
-namespace {
-    // TFLite globals
-    const tflite::Model* model = nullptr;
-    tflite::MicroInterpreter* interpreter = nullptr;
-    TfLiteTensor* input = nullptr;
-    TfLiteTensor* output = nullptr;
+using namespace CustomNN;
 
-    // Tensor arena for allocations
-    // Adjust this size based on your model requirements
-    constexpr int kTensorArenaSize = 10 * 1024;
-    uint8_t tensor_arena[kTensorArenaSize];
-}
+// Global neural network instance
+NeuralNetwork* model = nullptr;
 
 void setup_model() {
-    // Load the model
-    model = tflite::GetModel(scripts_model_tflite);
-    if (model->version() != TFLITE_SCHEMA_VERSION) {
-        printf("Model schema version %d doesn't match supported version %d!\n",
-               model->version(), TFLITE_SCHEMA_VERSION);
-        return;
-    }
-    printf("Model loaded successfully!\n");
+    printf("Initializing custom neural network...\n");
 
-    // Create the operator resolver
-    // Add only the operations your model needs to reduce memory usage
-    static tflite::MicroMutableOpResolver<2> resolver;
-    resolver.AddFullyConnected();
-    resolver.AddSoftmax();
+    // Create neural network with extracted weights
+    model = new NeuralNetwork(
+        LAYER1_WEIGHTS,  // Layer 1 weights [2][18]
+        LAYER1_BIAS,     // Layer 1 bias [18]
+        LAYER1_INPUT_SIZE,   // 2
+        LAYER1_OUTPUT_SIZE,  // 18
+        LAYER2_WEIGHTS,  // Layer 2 weights [18][3]
+        LAYER2_BIAS,     // Layer 2 bias [3]
+        LAYER2_INPUT_SIZE,   // 18
+        LAYER2_OUTPUT_SIZE   // 3
+    );
 
-    // Build the interpreter
-    static tflite::MicroInterpreter static_interpreter(
-        model, resolver, tensor_arena, kTensorArenaSize);
-    interpreter = &static_interpreter;
-
-    // Allocate memory for the model's tensors
-    TfLiteStatus allocate_status = interpreter->AllocateTensors();
-    if (allocate_status != kTfLiteOk) {
-        printf("AllocateTensors() failed!\n");
-        return;
-    }
-    printf("Tensors allocated successfully!\n");
-
-    // Get pointers to the model's input and output tensors
-    input = interpreter->input(0);
-    output = interpreter->output(0);
-
-    // Print input/output info
-    printf("Input shape: [%d, %d]\n", input->dims->data[0], input->dims->data[1]);
-    printf("Output shape: [%d, %d]\n", output->dims->data[0], output->dims->data[1]);
+    printf("✓ Custom neural network initialized!\n");
+    printf("  Input size: %zu\n", LAYER1_INPUT_SIZE);
+    printf("  Hidden layer: %zu neurons (ReLU)\n", LAYER1_OUTPUT_SIZE);
+    printf("  Output size: %zu classes (Softmax)\n", LAYER2_OUTPUT_SIZE);
+    sleep_ms(500);
+    printf("This is the custom Miko, zero dependent code!");
+    sleep_ms(500);
 }
 
 void run_inference(float x, float y) {
-    if (!interpreter || !input || !output) {
-        printf("Model not initialized!\n");
+    if (!model) {
+        printf("Error: Model not initialized!\n");
         return;
     }
 
-    // Set input values
-    input->data.f[0] = x;
-    input->data.f[1] = y;
+    // Prepare input
+    float input[2] = {x, y};
+    float output[3];
 
     // Run inference
-    TfLiteStatus invoke_status = interpreter->Invoke();
-    if (invoke_status != kTfLiteOk) {
-        printf("Invoke failed!\n");
-        return;
-    }
-
-    // Read output
-    float class_0_prob = output->data.f[0];
-    float class_1_prob = output->data.f[1];
-    float class_2_prob = output->data.f[2];
+    model->predict(input, output);
 
     // Find predicted class
     int predicted_class = 0;
-    float max_prob = class_0_prob;
+    float max_prob = output[0];
 
-    if (class_1_prob > max_prob) {
-        predicted_class = 1;
-        max_prob = class_1_prob;
-    }
-    if (class_2_prob > max_prob) {
-        predicted_class = 2;
-        max_prob = class_2_prob;
+    for (int i = 1; i < 3; ++i) {
+        if (output[i] > max_prob) {
+            max_prob = output[i];
+            predicted_class = i;
+        }
     }
 
     // Print results
-    printf("\n--- Inference Results ---\n");
+    printf("\n--- Custom NN Inference ---\n");
     printf("Input: (%.2f, %.2f)\n", x, y);
-    printf("Class 0 probability: %.4f\n", class_0_prob);
-    printf("Class 1 probability: %.4f\n", class_1_prob);
-    printf("Class 2 probability: %.4f\n", class_2_prob);
+    printf("Class 0 probability: %.4f\n", output[0]);
+    printf("Class 1 probability: %.4f\n", output[1]);
+    printf("Class 2 probability: %.4f\n", output[2]);
     printf("Predicted class: %d (confidence: %.4f)\n", predicted_class, max_prob);
-    printf("------------------------\n");
+    printf("---------------------------\n");
 }
 
 int main() {
     stdio_init_all();
-    tflite::InitializeTarget();
 
     // Initialize LED
     const uint LED_PIN = PICO_DEFAULT_LED_PIN;
     gpio_init(LED_PIN);
     gpio_set_dir(LED_PIN, GPIO_OUT);
 
-    printf("\n=== Miko TFLite Demo ===\n");
-    printf("Model size: %u bytes\n", scripts_model_tflite_len);
+    printf("\n=== Miko Custom NN Demo ===\n");
+    printf("Model: Gaussian Blob Classifier\n");
+    printf("Implementation: Custom C++ (no TFLite)\n\n");
 
-    // Setup the TFLite model
+    // Setup the custom neural network
     setup_model();
 
     // Example test inputs
@@ -129,6 +101,11 @@ int main() {
 
     int test_idx = 0;
     while (true) {
+        printf("=========================================================\n");
+        printf("Welcome to the Miko Microcontroller!\n");
+        printf("=========================================================\n");
+        sleep_ms(500);
+        printf("\n\nRunning demo tests for inferences: \n\n");
         // Blink LED to show activity
         gpio_put(LED_PIN, 1);
 
