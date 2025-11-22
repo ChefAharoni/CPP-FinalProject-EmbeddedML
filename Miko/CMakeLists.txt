@@ -33,38 +33,38 @@ project(Miko C CXX ASM)
 # Initialise the Raspberry Pi Pico SDK
 pico_sdk_init()
 
-# Add pico-tflmicro library (custom wrapper to avoid SDK re-initialization)
-include(pico_tflmicro.cmake)
-
-# Add executable. Default name is the project name, version 0.1
+# ============================================================================
+# Miko - Custom Neural Network Implementation
+# Pure C++ implementation with zero external ML library dependencies
+# ============================================================================
 
 add_executable(Miko
     Miko.cpp
-    model_data.cc
+    neural_network.cpp
 )
 
 pico_set_program_name(Miko "Miko")
-pico_set_program_version(Miko "0.1")
+pico_set_program_version(Miko "1.0")
 
-# Set compiler flags for TensorFlow Lite compatibility
+# Set compiler flags for C++ compatibility
 set_target_properties(
     Miko
     PROPERTIES
-    COMPILE_FLAGS "-fno-rtti -fno-exceptions -fno-threadsafe-statics"
+    COMPILE_FLAGS "-fno-exceptions"
 )
 
-# Modify the below lines to enable/disable output over UART/USB
+# Enable USB output for serial communication
 pico_enable_stdio_uart(Miko 0)
 pico_enable_stdio_usb(Miko 1)
 
-# Add the standard library to the build
+# Link only the Pico standard library (no TensorFlow Lite or external ML libraries)
 target_link_libraries(Miko
-        pico_stdlib
-        pico-tflmicro)
+    pico_stdlib
+)
 
-# Add the standard include files to the build
+# Add include directories
 target_include_directories(Miko PRIVATE
-        ${CMAKE_CURRENT_LIST_DIR}
+    ${CMAKE_CURRENT_LIST_DIR}
 )
 
 pico_add_extra_outputs(Miko)
