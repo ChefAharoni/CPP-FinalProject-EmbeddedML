@@ -7,7 +7,7 @@ Simple ML model for Gaussian blob detection. Minimal proof-of-concept for TFLite
 Install dependencies:
 
 ```bash
-pip install numpy scikit-learn tensorflow
+pip install -r requirements.txt
 ```
 
 ## Training
