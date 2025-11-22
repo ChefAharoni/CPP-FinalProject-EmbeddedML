@@ -3,3 +3,6 @@ pico_ml
 .DS_Store
 */.DS_Store
 venvMikoENV/
+.vscode/settings.json
+pico/pico-examples
+
