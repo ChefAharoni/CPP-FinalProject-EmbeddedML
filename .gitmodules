@@ -4,3 +4,6 @@
 [submodule "pico/pico-examples"]
 	path = pico/pico-examples
 	url = https://github.com/raspberrypi/pico-examples.git
+[submodule "pico-tflmicro"]
+	path = pico-tflmicro
+	url = https://github.com/raspberrypi/pico-tflmicro.git
