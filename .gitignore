@@ -3,3 +3,4 @@ pico_ml
 .DS_Store
 */.DS_Store
 scripts/model.tflite
+venvMikoENV/
