@@ -1,114 +1,62 @@
-# Compiler and flags
-CXX = g++
-CXXFLAGS = -std=c++23 \
-           -Wall \
-           -Wextra \
-           -Werror \
-           -Wpedantic \
-           -Wshadow \
-           -Wconversion \
-           -Wsign-conversion \
-           -Wnull-dereference \
-           -Wold-style-cast \
-           -Wcast-align \
-           -Wunused \
-           -Woverloaded-virtual \
-           -Wformat=2 \
-           -O2
+# TensorFlow Lite paths
+TFLITE_INCLUDE ?= $(HOME)/tflite-build/tensorflow
+TFLITE_LIB_DIR ?= $(HOME)/tflite-build/tensorflow/tensorflow/lite/cmake-build
+
+# If libs are inside cmake-build/lib, prefer that
+TFLITE_LIB_SUBDIR ?= $(TFLITE_LIB_DIR)          # adjust if your .a is in a /lib subfolder
+TFLITE_LIB        := $(TFLITE_LIB_SUBDIR)/libtensorflow-lite.a
+
+RUY_LIB_DIR ?= $(TFLITE_LIB_DIR)/_deps/ruy-build/ruy
+RUY_LIBS    := $(wildcard $(RUY_LIB_DIR)/libruy*.a)
+
+CPUINFO_LIB_DIR ?= $(TFLITE_LIB_DIR)/_deps/cpuinfo-build
+CPUINFO_LIB := $(CPUINFO_LIB_DIR)/libcpuinfo.a
+
+PTHREADPOOL_LIB_DIR ?= $(TFLITE_LIB_DIR)/pthreadpool
+PTHREADPOOL_LIB := $(PTHREADPOOL_LIB_DIR)/libpthreadpool.a
 
 
-# Source directory and files
+# FlatBuffers include: you FOUND it here
+FLATBUFFERS_INCLUDE ?= $(TFLITE_LIB_DIR)/flatbuffers/include
+
+FFT2D_LIB_DIR ?= $(TFLITE_LIB_DIR)/_deps/fft2d-build
+
+PTHREADPOOL_LIB_DIR ?= $(TFLITE_LIB_DIR)/pthreadpool
+
+ifdef TFLITE_INCLUDE_PATH
+	TFLITE_INCLUDE = $(TFLITE_INCLUDE_PATH)
+endif
+ifdef TFLITE_LIB_PATH
+	TFLITE_LIB_DIR = $(TFLITE_LIB_PATH)
+endif
+
+# Compiler flags
+CXXFLAGS = -std=c++20 \
+  -I$(TFLITE_INCLUDE) \
+  -I$(FLATBUFFERS_INCLUDE)
+
+# Linker flags
+# Main TFLite lib first, then fft2d libs (static link order matters).
+LDFLAGS = \
+  -L$(TFLITE_LIB_SUBDIR) -ltensorflow-lite \
+  $(foreach L,$(RUY_LIBS),-Wl,-force_load,$(L)) \
+  -Wl,-force_load,$(CPUINFO_LIB) \
+  -Wl,-force_load,$(PTHREADPOOL_LIB) \
+  -lpthread -lm -ldl
+
+# Build
 SRCDIR = src
-
-# Identify main/tester and library sources explicitly so we only compile
-# the desired entrypoint depending on the target used.
-MAIN_SRC   = $(SRCDIR)/main.cpp
-TEST_SRC   = $(SRCDIR)/tester.cpp
-
-# All other .cpp files in src are treated as library code
-LIB_SOURCES = $(filter-out $(MAIN_SRC) $(TEST_SRC), $(wildcard $(SRCDIR)/*.cpp))
-
-# Application and tester source lists
-APP_SOURCES    = $(LIB_SOURCES) $(MAIN_SRC)
-TESTER_SOURCES = $(LIB_SOURCES) $(TEST_SRC)
-
-# Object files (generated from source files)
-OBJECTS = $(APP_SOURCES:.cpp=.o)
-TESTER_OBJECTS = $(TESTER_SOURCES:.cpp=.o)
-
-# Header files (for dependency tracking)
-HEADERS = $(wildcard $(SRCDIR)/*.h)
-
-# Default target executable (built from main.cpp)
+SOURCES = $(wildcard $(SRCDIR)/*.cpp)
+OBJECTS = $(SOURCES:.cpp=.o)
 TARGET = pico_ml
 
-# Tester executable (built from tester.cpp only when `make tester` is invoked)
-TESTER_TARGET = pico_ml_tester
-
-# Default target: build the executable
-all: $(TARGET)
-
-# Link object files to create executable
 $(TARGET): $(OBJECTS)
-	@echo "Linking $(TARGET) (uses main.cpp)..."
-	$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJECTS)
-	@echo "Build successful! Run with: ./$(TARGET)"
+	$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJECTS) $(LDFLAGS)
 
-# Tester target: build a separate binary using tester.cpp as the entrypoint.
-$(TESTER_TARGET): $(TESTER_OBJECTS)
-	@echo "Linking $(TESTER_TARGET) (uses tester.cpp)..."
-	$(CXX) $(CXXFLAGS) -o $(TESTER_TARGET) $(TESTER_OBJECTS)
-	@echo "Tester build successful! Run with: ./$(TESTER_TARGET)"
-
-# Compile source files to object files
-# This pattern works with files under $(SRCDIR) (e.g. src/Imatrix.cpp -> src/Imatrix.o)
-%.o: %.cpp $(HEADERS)
-	@echo "Compiling $<..."
+%.o: %.cpp
 	$(CXX) $(CXXFLAGS) -c $< -o $@
 
-# Run the default program (built from main.cpp)
-run: $(TARGET)
-	@echo "Running $(TARGET)..."
-	@./$(TARGET)
-
-# Run the tester binary (built from tester.cpp)
-run-tester: $(TESTER_TARGET)
-	@echo "Running $(TESTER_TARGET)..."
-	@./$(TESTER_TARGET)
-
-# Clean build artifacts
 clean:
-	@echo "Cleaning build artifacts..."
-	 rm -f $(OBJECTS) $(TESTER_OBJECTS) $(TARGET) $(TESTER_TARGET)
-	@echo "Clean complete."
+	rm -f $(OBJECTS) $(TARGET)
 
-# Rebuild from scratch
-rebuild: clean all
-
-# Debug build with debug symbols and no optimization
-debug: CXXFLAGS += -g -O0 -DDEBUG
-debug: clean $(TARGET)
-	@echo "Debug build complete. Run with gdb: gdb ./$(TARGET)"
-
-# Check for memory leaks using valgrind (if available)
-memcheck: $(TARGET)
-	@echo "Running memory leak check..."
-	valgrind --leak-check=full --show-leak-kinds=all --track-origins=yes ./$(TARGET)
-
-
-# Show help
-help:
-	@echo "Embedded ML Makefile"
-	@echo "================"
-	@echo "Available targets:"
-	@echo "  all       - Build the project (default)"
-	@echo "  run       - Build and run the program"
-	@echo "  clean     - Remove all build artifacts"
-	@echo "  rebuild   - Clean and rebuild from scratch"
-	@echo "  debug     - Build with debug symbols"
-	@echo "  memcheck  - Run valgrind memory leak check"
-	@echo "  help      - Show this help message"
-	@echo ""
-
-# Phony targets (not actual files)
-.PHONY: all run run-tester tester clean rebuild debug memcheck help $(TESTER_TARGET)
+.PHONY: clean
