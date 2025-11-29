@@ -105,4 +105,6 @@ Automatically generated build file that:
 ## Sources
 
 MNIST Digit recognition TFLite model by Mirosław Stanek, via https://github.com/frogermcs/MNIST-TFLite
+MNIST Dataset by Yann LeCunn https://www.kaggle.com/datasets/alexanderyyy/mnist-png
+Simple MNIST Convolutional Neural Network trained by Kunal Jain https://github.com/kj7kunal/MNIST-Keras/tree/master
 
