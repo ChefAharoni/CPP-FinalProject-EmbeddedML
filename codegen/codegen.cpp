@@ -77,7 +77,125 @@ string GetShapeString(const TfLiteIntArray* dims) {
     return ss.str();
 }
 
+// Validate operators from model schema before building interpreter
+// This provides clear error messages before TFLite tries to process unsupported ops
+bool ValidateModelSchema(const tflite::FlatBufferModel& model) {
+    const tflite::Model* model_ptr = model.GetModel();
+    if (!model_ptr || !model_ptr->subgraphs() || model_ptr->subgraphs()->size() == 0) {
+        cerr << "Error: Invalid model structure - no subgraphs found." << endl;
+        return false;
+    }
+
+    // Get the main subgraph (usually index 0)
+    const tflite::SubGraph* subgraph = model_ptr->subgraphs()->Get(0);
+    if (!subgraph || !subgraph->operators()) {
+        cerr << "Error: Invalid model structure - no operators found." << endl;
+        return false;
+    }
+
+    // Get operator codes
+    const flatbuffers::Vector<flatbuffers::Offset<tflite::OperatorCode>>* op_codes = 
+        model_ptr->operator_codes();
+    if (!op_codes) {
+        cerr << "Error: Invalid model structure - no operator codes found." << endl;
+        return false;
+    }
+
+    bool ok = true;
+    vector<string> unsupported_ops;
+    vector<pair<int, int>> unsupported_activations; // (operator_index, activation_code)
+
+    // Set of supported operators
+    set<tflite::BuiltinOperator> supported_ops = {
+        tflite::BuiltinOperator_FULLY_CONNECTED,
+        tflite::BuiltinOperator_SOFTMAX,
+        tflite::BuiltinOperator_RELU
+    };
+
+    // Check each operator in the model
+    for (size_t i = 0; i < subgraph->operators()->size(); ++i) {
+        const tflite::Operator* op = subgraph->operators()->Get(i);
+        if (!op) continue;
+
+        // Get operator code index
+        int op_code_index = op->opcode_index();
+        if (op_code_index < 0 || op_code_index >= static_cast<int>(op_codes->size())) {
+            cerr << "Error: Invalid operator code index " << op_code_index 
+                 << " at operator " << i << "." << endl;
+            ok = false;
+            continue;
+        }
+
+        const tflite::OperatorCode* op_code = op_codes->Get(op_code_index);
+        if (!op_code) continue;
+
+        tflite::BuiltinOperator builtin_code = 
+            static_cast<tflite::BuiltinOperator>(op_code->builtin_code());
+
+        // Check if operator is supported
+        if (supported_ops.find(builtin_code) == supported_ops.end()) {
+            string op_name;
+            if (op_code->builtin_code() == tflite::BuiltinOperator_CUSTOM) {
+                op_name = string("CUSTOM:") + 
+                    (op_code->custom_code() ? op_code->custom_code()->c_str() : "");
+            } else {
+                const char* op_name_ptr = tflite::EnumNameBuiltinOperator(builtin_code);
+                op_name = op_name_ptr ? op_name_ptr : "UNKNOWN";
+            }
+            unsupported_ops.push_back(op_name + " (at operator " + to_string(i) + ")");
+            ok = false;
+        }
+
+        // For FULLY_CONNECTED, check fused activation
+        if (builtin_code == tflite::BuiltinOperator_FULLY_CONNECTED) {
+            const tflite::FullyConnectedOptions* options = 
+                op->builtin_options_as_FullyConnectedOptions();
+            if (options) {
+                tflite::ActivationFunctionType activation = options->fused_activation_function();
+                if (activation != tflite::ActivationFunctionType_NONE &&
+                    activation != tflite::ActivationFunctionType_RELU) {
+                    unsupported_activations.push_back({static_cast<int>(i), static_cast<int>(activation)});
+                    ok = false;
+                }
+            }
+        }
+    }
+
+    // Print clear error messages
+    if (!ok) {
+        cerr << "\n================================================" << endl;
+        cerr << "ERROR: Model contains unsupported operations!" << endl;
+        cerr << "================================================" << endl;
+        cerr << "\nThis code generator only supports the following operations:" << endl;
+        cerr << "  - FULLY_CONNECTED (with NONE or RELU activation)" << endl;
+        cerr << "  - SOFTMAX" << endl;
+        cerr << "  - RELU" << endl;
+        
+        if (!unsupported_ops.empty()) {
+            cerr << "\nUnsupported operators found in model:" << endl;
+            for (const auto& op : unsupported_ops) {
+                cerr << "  - " << op << endl;
+            }
+        }
+        
+        if (!unsupported_activations.empty()) {
+            cerr << "\nUnsupported fused activations found:" << endl;
+            for (const auto& [op_idx, act_code] : unsupported_activations) {
+                cerr << "  - Operator " << op_idx << " has unsupported activation code: " 
+                     << act_code << " (only NONE=0 and RELU=1 are supported)" << endl;
+            }
+        }
+        
+        cerr << "\nCode generation aborted." << endl;
+        cerr << "Please use a model that only contains supported operations." << endl;
+        cerr << "================================================\n" << endl;
+    }
+
+    return ok;
+}
+
 // Validate that the model only uses supported operators and activations
+// (This is a secondary check after interpreter is built, for additional validation)
 bool ValidateModel(tflite::Interpreter& interpreter) {
     const auto& execution_plan = interpreter.execution_plan();
     bool ok = true;
@@ -744,6 +862,14 @@ int main(int argc, char* argv[]) {
     
     cout << "Model loaded successfully!" << endl;
     
+    // Validate model schema BEFORE building interpreter
+    // This provides clear error messages for unsupported operations
+    cout << "Validating model operations..." << endl;
+    if (!ValidateModelSchema(*model)) {
+        return 1;
+    }
+    cout << "Model validation passed - all operations are supported!" << endl;
+    
     // Build the interpreter
     tflite::MutableOpResolver resolver;
     resolver.AddBuiltin(tflite::BuiltinOperator_FULLY_CONNECTED,
@@ -757,18 +883,22 @@ int main(int argc, char* argv[]) {
     
     tflite::InterpreterBuilder builder(*model, resolver);
     if (builder(&interpreter) != kTfLiteOk) {
-        cerr << "Error: Failed to construct interpreter." << endl;
+        cerr << "\nError: Failed to construct interpreter." << endl;
+        cerr << "This may indicate an issue with the model structure." << endl;
+        cerr << "Note: Model operations were validated, but interpreter construction failed." << endl;
+        cerr << "This could be due to an internal TFLite error or model format issue." << endl;
         return 1;
     }
     
     if (!interpreter) {
-        cerr << "Error: Interpreter is null." << endl;
+        cerr << "\nError: Interpreter is null after construction." << endl;
         return 1;
     }
     
     // Allocate tensors
     if (interpreter->AllocateTensors() != kTfLiteOk) {
-        cerr << "Error: Failed to allocate tensors." << endl;
+        cerr << "\nError: Failed to allocate tensors." << endl;
+        cerr << "This may indicate a memory issue or invalid tensor configuration." << endl;
         return 1;
     }
     
