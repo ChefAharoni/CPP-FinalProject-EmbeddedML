@@ -386,15 +386,41 @@ int main(int argc, char* argv[]) {
     // tflite::ops::builtin::BuiltinOpResolver resolver;
 	tflite::MutableOpResolver resolver;
 
+	// Fully connected layers
 	resolver.AddBuiltin(tflite::BuiltinOperator_FULLY_CONNECTED,
 		tflite::ops::builtin::Register_FULLY_CONNECTED());
 	resolver.AddBuiltin(tflite::BuiltinOperator_SOFTMAX,
 		tflite::ops::builtin::Register_SOFTMAX());
 
+	// Activation functions
 	// Only add RELU if your model has a separate RELU op.
 	// (Many converters fuse relu into FULLY_CONNECTED.)
 	resolver.AddBuiltin(tflite::BuiltinOperator_RELU,
 		tflite::ops::builtin::Register_RELU());
+
+	// CNN operations
+	resolver.AddBuiltin(tflite::BuiltinOperator_CONV_2D,
+		tflite::ops::builtin::Register_CONV_2D());
+	resolver.AddBuiltin(tflite::BuiltinOperator_DEPTHWISE_CONV_2D,
+		tflite::ops::builtin::Register_DEPTHWISE_CONV_2D());
+	resolver.AddBuiltin(tflite::BuiltinOperator_MAX_POOL_2D,
+		tflite::ops::builtin::Register_MAX_POOL_2D());
+	resolver.AddBuiltin(tflite::BuiltinOperator_AVERAGE_POOL_2D,
+		tflite::ops::builtin::Register_AVERAGE_POOL_2D());
+
+	// Common operations used in CNNs
+	resolver.AddBuiltin(tflite::BuiltinOperator_RESHAPE,
+		tflite::ops::builtin::Register_RESHAPE());
+	resolver.AddBuiltin(tflite::BuiltinOperator_CONCATENATION,
+		tflite::ops::builtin::Register_CONCATENATION());
+	resolver.AddBuiltin(tflite::BuiltinOperator_PAD,
+		tflite::ops::builtin::Register_PAD());
+	resolver.AddBuiltin(tflite::BuiltinOperator_SHAPE,
+		tflite::ops::builtin::Register_SHAPE());
+	resolver.AddBuiltin(tflite::BuiltinOperator_STRIDED_SLICE,
+		tflite::ops::builtin::Register_STRIDED_SLICE());
+        resolver.AddBuiltin(tflite::BuiltinOperator_PACK,
+            tflite::ops::builtin::Register_PACK());
 
     unique_ptr<tflite::Interpreter> interpreter;
     
