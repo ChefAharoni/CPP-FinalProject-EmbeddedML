@@ -77,6 +77,68 @@ string GetShapeString(const TfLiteIntArray* dims) {
     return ss.str();
 }
 
+// Validate that the model only uses supported operators and activations
+bool ValidateModel(tflite::Interpreter& interpreter) {
+    const auto& execution_plan = interpreter.execution_plan();
+    bool ok = true;
+
+    for (size_t i = 0; i < execution_plan.size(); ++i) {
+        const int node_index = execution_plan[i];
+        const auto* node_and_reg = interpreter.node_and_registration(node_index);
+        if (!node_and_reg) {
+            continue;
+        }
+
+        const auto& node = node_and_reg->first;
+        const auto& registration = node_and_reg->second;
+
+        tflite::BuiltinOperator op_code =
+            static_cast<tflite::BuiltinOperator>(registration.builtin_code);
+        string op_name = GetOperatorName(interpreter, node_index);
+
+        // Check operator support
+        switch (op_code) {
+            case tflite::BuiltinOperator_FULLY_CONNECTED:
+            case tflite::BuiltinOperator_SOFTMAX:
+            case tflite::BuiltinOperator_RELU:
+                // Supported
+                break;
+            default:
+                cerr << "Error: Unsupported operator '" << op_name
+                     << "' (builtin code " << registration.builtin_code
+                     << ") at node " << node_index << "." << endl;
+                ok = false;
+                continue;
+        }
+
+        // For FULLY_CONNECTED, validate fused activation
+        if (op_code == tflite::BuiltinOperator_FULLY_CONNECTED) {
+            TfLiteFusedActivation fused_activation = kTfLiteActNone;
+            const void* builtin_data = node.builtin_data;
+            if (builtin_data) {
+                const TfLiteFullyConnectedParams* params =
+                    static_cast<const TfLiteFullyConnectedParams*>(builtin_data);
+                fused_activation = params->activation;
+            }
+
+            if (fused_activation != kTfLiteActNone &&
+                fused_activation != kTfLiteActRelu) {
+                cerr << "Error: Unsupported fused activation (" << fused_activation
+                     << ") in FULLY_CONNECTED node " << node_index
+                     << ". Only NONE and RELU are supported." << endl;
+                ok = false;
+            }
+        }
+    }
+
+    if (!ok) {
+        cerr << "Code generation aborted due to unsupported operators/activations."
+             << endl;
+    }
+
+    return ok;
+}
+
 // Escape identifier for C++
 string EscapeIdentifier(const string& name) {
     string result;
@@ -711,6 +773,11 @@ int main(int argc, char* argv[]) {
     }
     
     cout << "Interpreter initialized successfully!" << endl;
+
+    // Validate that the model only uses supported operators/activations
+    if (!ValidateModel(*interpreter)) {
+        return 1;
+    }
     
     // Create output directory
     string output_dir = base_name;

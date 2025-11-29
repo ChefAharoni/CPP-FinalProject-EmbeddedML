@@ -102,3 +102,7 @@ Automatically generated build file that:
 - Intermediate buffers are statically allocated within the model class
 - All operations are in-place or use pre-allocated buffers
 
+## Sources
+
+MNIST Digit recognition TFLite model by Mirosław Stanek, via https://github.com/frogermcs/MNIST-TFLite
+
