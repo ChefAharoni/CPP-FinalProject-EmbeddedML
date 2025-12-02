@@ -144,6 +144,15 @@ bool ValidateModelSchema(const tflite::FlatBufferModel& model) {
             if (op_code->builtin_code() == tflite::BuiltinOperator_CUSTOM) {
                 op_name = string("CUSTOM:") + 
                     (op_code->custom_code() ? op_code->custom_code()->c_str() : "");
+                // Check if it's a supported custom operator (DROPOUT or FLATTEN)
+                string custom_name = op_code->custom_code() ? op_code->custom_code()->c_str() : "";
+                if (custom_name.find("DROPOUT") != string::npos || 
+                    custom_name.find("Dropout") != string::npos ||
+                    custom_name.find("FLATTEN") != string::npos ||
+                    custom_name.find("Flatten") != string::npos) {
+                    // Supported custom operator, skip the error
+                    continue;
+                }
             } else {
                 const char* op_name_ptr = tflite::EnumNameBuiltinOperator(builtin_code);
                 op_name = op_name_ptr ? op_name_ptr : "UNKNOWN";
@@ -193,6 +202,8 @@ bool ValidateModelSchema(const tflite::FlatBufferModel& model) {
         cerr << "  - STRIDED_SLICE" << endl;
         cerr << "  - PACK" << endl;
         cerr << "  - RESHAPE" << endl;
+        cerr << "  - DROPOUT (custom operator, no-op during inference)" << endl;
+        cerr << "  - FLATTEN (custom operator, converts to reshape)" << endl;
         
         if (!unsupported_ops.empty()) {
             cerr << "\nUnsupported operators found in model:" << endl;
@@ -238,6 +249,18 @@ bool ValidateModel(tflite::Interpreter& interpreter) {
         string op_name = GetOperatorName(interpreter, node_index);
 
         // Check operator support
+        // Note: DROPOUT and FLATTEN are not standard builtin operators but may appear as custom ops
+        if (op_code == tflite::BuiltinOperator_CUSTOM) {
+            // Check if it's a supported custom operator
+            if (op_name.find("DROPOUT") != string::npos || 
+                op_name.find("Dropout") != string::npos ||
+                op_name.find("FLATTEN") != string::npos ||
+                op_name.find("Flatten") != string::npos) {
+                // Supported custom operators
+                break;
+            }
+        }
+        
         switch (op_code) {
             case tflite::BuiltinOperator_FULLY_CONNECTED:
             case tflite::BuiltinOperator_SOFTMAX:
@@ -503,6 +526,8 @@ void GenerateModelFile(
     bool has_strided_slice = false;
     bool has_pack = false;
     bool has_reshape = false;
+    bool has_dropout = false;
+    bool has_flatten = false;
     
     const auto& execution_plan_check = interpreter.execution_plan();
     for (size_t i = 0; i < execution_plan_check.size(); ++i) {
@@ -524,6 +549,12 @@ void GenerateModelFile(
                 has_pack = true;
             } else if (op_name == "RESHAPE") {
                 has_reshape = true;
+            } else if (op_name.find("DROPOUT") != string::npos || 
+                       op_name.find("Dropout") != string::npos) {
+                has_dropout = true;
+            } else if (op_name.find("FLATTEN") != string::npos ||
+                       op_name.find("Flatten") != string::npos) {
+                has_flatten = true;
             }
         }
     }
@@ -548,6 +579,12 @@ void GenerateModelFile(
     }
     if (has_reshape) {
         out << "#include \"../../components/reshape.h\"\n";
+    }
+    if (has_dropout) {
+        out << "#include \"../../components/dropout.h\"\n";
+    }
+    if (has_flatten) {
+        out << "#include \"../../components/flatten.h\"\n";
     }
     
     out << "#include \"../../components/softmax.h\"\n";
@@ -959,6 +996,28 @@ void GenerateModelFile(
             
             // RESHAPE just copies data (memory layout is the same)
             out << "        Reshape(" << input_ptr << ", " << input_size_layer 
+                << ", " << output_ptr << ", " << output_size_layer << ");\n";
+        } else if (op_name.find("DROPOUT") != string::npos || 
+                   op_name.find("Dropout") != string::npos) {
+            used_components.insert("dropout");
+            
+            // Get dropout rate if available (though it's ignored during inference)
+            float dropout_rate = 0.0f;
+            const void* builtin_data = node.builtin_data;
+            // Note: Dropout typically doesn't have builtin_data in TFLite
+            // as it's usually removed or converted during conversion
+            
+            out << "        // DROPOUT: No-op during inference (passes through input)\n";
+            out << "        Dropout(" << input_ptr << ", " << output_ptr << ", " 
+                << output_size_layer << ", " << dropout_rate << "f);\n";
+        } else if (op_name.find("FLATTEN") != string::npos ||
+                   op_name.find("Flatten") != string::npos) {
+            used_components.insert("flatten");
+            
+            // FLATTEN is essentially a reshape to 1D (except batch dimension)
+            // For our purposes, it's the same as Reshape
+            out << "        // FLATTEN: Flatten multi-dimensional tensor to 1D\n";
+            out << "        Flatten(" << input_ptr << ", " << input_size_layer 
                 << ", " << output_ptr << ", " << output_size_layer << ");\n";
         } else {
             cerr << "Warning: Unsupported operation " << op_name << endl;

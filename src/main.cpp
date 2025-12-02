@@ -419,8 +419,34 @@ int main(int argc, char* argv[]) {
 		tflite::ops::builtin::Register_SHAPE());
 	resolver.AddBuiltin(tflite::BuiltinOperator_STRIDED_SLICE,
 		tflite::ops::builtin::Register_STRIDED_SLICE());
-        resolver.AddBuiltin(tflite::BuiltinOperator_PACK,
-            tflite::ops::builtin::Register_PACK());
+    resolver.AddBuiltin(tflite::BuiltinOperator_PACK,
+        tflite::ops::builtin::Register_PACK());
+    resolver.AddBuiltin(tflite::BuiltinOperator_SPLIT_V,
+        tflite::ops::builtin::Register_SPLIT_V());
+    resolver.AddBuiltin(tflite::BuiltinOperator_NEG,
+        tflite::ops::builtin::Register_NEG());
+    resolver.AddBuiltin(tflite::BuiltinOperator_FLOOR_DIV,
+        tflite::ops::builtin::Register_FLOOR_DIV());
+    resolver.AddBuiltin(tflite::BuiltinOperator_RANGE,
+        tflite::ops::builtin::Register_RANGE());
+    resolver.AddBuiltin(tflite::BuiltinOperator_SUB,
+        tflite::ops::builtin::Register_SUB());
+    resolver.AddBuiltin(tflite::BuiltinOperator_ADD,
+        tflite::ops::builtin::Register_ADD());
+    resolver.AddBuiltin(tflite::BuiltinOperator_MUL,
+        tflite::ops::builtin::Register_MUL());
+    resolver.AddBuiltin(tflite::BuiltinOperator_MAXIMUM,
+        tflite::ops::builtin::Register_MAXIMUM());
+    resolver.AddBuiltin(tflite::BuiltinOperator_PADV2,
+        tflite::ops::builtin::Register_PADV2());
+    resolver.AddBuiltin(tflite::BuiltinOperator_GATHER,
+        tflite::ops::builtin::Register_GATHER());
+    resolver.AddBuiltin(tflite::BuiltinOperator_EXPAND_DIMS,
+        tflite::ops::builtin::Register_EXPAND_DIMS());
+    // Note: RFFT2D is not available in all TFLite builds
+    // Uncomment the following line if your TFLite build includes RFFT2D support:
+    // resolver.AddBuiltin(tflite::BuiltinOperator_RFFT2D,
+    //     tflite::ops::builtin::Register_RFFT2D());
 
     unique_ptr<tflite::Interpreter> interpreter;
     

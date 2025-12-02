@@ -107,4 +107,5 @@ Automatically generated build file that:
 MNIST Digit recognition TFLite model by Mirosław Stanek, via https://github.com/frogermcs/MNIST-TFLite
 MNIST Dataset by Yann LeCunn https://www.kaggle.com/datasets/alexanderyyy/mnist-png
 Simple MNIST Convolutional Neural Network trained by Kunal Jain https://github.com/kj7kunal/MNIST-Keras/tree/master
+Speech Command Recognition model by Coimbra de Andrade et al https://arxiv.org/pdf/1808.08929 https://github.com/douglas125/SpeechCmdRecognition
 
