@@ -1,5 +1,6 @@
 // codegen/codegen.cpp
 // Code generator that reads TFLite models and generates pure C++ inference code
+// Direct FlatBuffer inspection without requiring operator implementations
 
 #include <iostream>
 #include <fstream>
@@ -19,75 +20,92 @@
 #define mkdir(path, mode) _mkdir(path)
 #endif
 
-// TensorFlow Lite headers
-#include "tensorflow/lite/model_builder.h"
-#include "tensorflow/lite/interpreter.h"
-#include "tensorflow/lite/kernels/register.h"
+// TensorFlow Lite FlatBuffer schema header
 #include "tensorflow/lite/schema/schema_generated.h"
-#include "tensorflow/lite/kernels/builtin_op_kernels.h"
-#include "tensorflow/lite/c/common.h"
+// Only need builtin_op_data for activation/padding enums
 #include "tensorflow/lite/c/builtin_op_data.h"
 
 using namespace std;
 
 namespace {
 
-// Helper to get operator name
-string GetOperatorName(const tflite::Interpreter& interpreter, int node_index) {
-    const auto* node_and_reg = interpreter.node_and_registration(node_index);
-    if (!node_and_reg) {
+// Helper to get operator name from FlatBuffer
+string GetOperatorName(const tflite::OperatorCode* op_code) {
+    if (!op_code) {
         return "UNKNOWN";
     }
     
-    const auto& registration = node_and_reg->second;
-    if (registration.builtin_code != tflite::BuiltinOperator_CUSTOM) {
-        return tflite::EnumNameBuiltinOperator(
-            static_cast<tflite::BuiltinOperator>(registration.builtin_code));
+    if (op_code->builtin_code() != tflite::BuiltinOperator_CUSTOM) {
+        const char* name = tflite::EnumNameBuiltinOperator(
+            static_cast<tflite::BuiltinOperator>(op_code->builtin_code()));
+        return name ? name : "UNKNOWN";
     } else {
-        return string("CUSTOM:") + (registration.custom_name ? registration.custom_name : "");
+        string result = "CUSTOM:";
+        if (op_code->custom_code()) {
+            result += op_code->custom_code()->c_str();
+        }
+        return result;
     }
 }
 
-// Calculate tensor size
-size_t CalculateTensorSize(const TfLiteIntArray* dims) {
-    if (!dims || dims->size == 0) {
+// Calculate tensor size from FlatBuffer shape
+size_t CalculateTensorSize(const flatbuffers::Vector<int32_t>* shape) {
+    if (!shape || shape->size() == 0) {
         return 1;
     }
     
     size_t size = 1;
-    for (int i = 0; i < dims->size; ++i) {
-        size *= static_cast<size_t>(dims->data[i]);
+    for (size_t i = 0; i < shape->size(); ++i) {
+        size *= static_cast<size_t>(shape->Get(i));
     }
     return size;
 }
 
-// Get shape as string
-string GetShapeString(const TfLiteIntArray* dims) {
-    if (!dims || dims->size == 0) {
+// Get shape as string from FlatBuffer
+string GetShapeString(const flatbuffers::Vector<int32_t>* shape) {
+    if (!shape || shape->size() == 0) {
         return "1";
     }
     
     stringstream ss;
-    for (int i = 0; i < dims->size; ++i) {
-        ss << dims->data[i];
-        if (i < dims->size - 1) {
+    for (size_t i = 0; i < shape->size(); ++i) {
+        ss << shape->Get(i);
+        if (i < shape->size() - 1) {
             ss << ", ";
         }
     }
     return ss.str();
 }
 
-// Validate operators from model schema before building interpreter
-// This provides clear error messages before TFLite tries to process unsupported ops
-bool ValidateModelSchema(const tflite::FlatBufferModel& model) {
-    const tflite::Model* model_ptr = model.GetModel();
-    if (!model_ptr || !model_ptr->subgraphs() || model_ptr->subgraphs()->size() == 0) {
+// Get bytes per element based on tensor type
+size_t GetBytesPerElement(tflite::TensorType type) {
+    switch (type) {
+        case tflite::TensorType_FLOAT32: return 4;
+        case tflite::TensorType_INT32: return 4;
+        case tflite::TensorType_UINT8: return 1;
+        case tflite::TensorType_INT64: return 8;
+        case tflite::TensorType_INT16: return 2;
+        case tflite::TensorType_INT8: return 1;
+        case tflite::TensorType_FLOAT16: return 2;
+        case tflite::TensorType_FLOAT64: return 8;
+        case tflite::TensorType_UINT64: return 8;
+        case tflite::TensorType_UINT32: return 4;
+        case tflite::TensorType_UINT16: return 2;
+        case tflite::TensorType_BOOL: return 1;
+        default: return 0;
+    }
+}
+
+// Validate operators from model schema
+// This provides clear error messages for unsupported operations
+bool ValidateModelSchema(const tflite::Model* model) {
+    if (!model || !model->subgraphs() || model->subgraphs()->size() == 0) {
         cerr << "Error: Invalid model structure - no subgraphs found." << endl;
         return false;
     }
 
     // Get the main subgraph (usually index 0)
-    const tflite::SubGraph* subgraph = model_ptr->subgraphs()->Get(0);
+    const tflite::SubGraph* subgraph = model->subgraphs()->Get(0);
     if (!subgraph || !subgraph->operators()) {
         cerr << "Error: Invalid model structure - no operators found." << endl;
         return false;
@@ -95,7 +113,7 @@ bool ValidateModelSchema(const tflite::FlatBufferModel& model) {
 
     // Get operator codes
     const flatbuffers::Vector<flatbuffers::Offset<tflite::OperatorCode>>* op_codes = 
-        model_ptr->operator_codes();
+        model->operator_codes();
     if (!op_codes) {
         cerr << "Error: Invalid model structure - no operator codes found." << endl;
         return false;
@@ -228,103 +246,6 @@ bool ValidateModelSchema(const tflite::FlatBufferModel& model) {
     return ok;
 }
 
-// Validate that the model only uses supported operators and activations
-// (This is a secondary check after interpreter is built, for additional validation)
-bool ValidateModel(tflite::Interpreter& interpreter) {
-    const auto& execution_plan = interpreter.execution_plan();
-    bool ok = true;
-
-    for (size_t i = 0; i < execution_plan.size(); ++i) {
-        const int node_index = execution_plan[i];
-        const auto* node_and_reg = interpreter.node_and_registration(node_index);
-        if (!node_and_reg) {
-            continue;
-        }
-
-        const auto& node = node_and_reg->first;
-        const auto& registration = node_and_reg->second;
-
-        tflite::BuiltinOperator op_code =
-            static_cast<tflite::BuiltinOperator>(registration.builtin_code);
-        string op_name = GetOperatorName(interpreter, node_index);
-
-        // Check operator support
-        // Note: DROPOUT and FLATTEN are not standard builtin operators but may appear as custom ops
-        if (op_code == tflite::BuiltinOperator_CUSTOM) {
-            // Check if it's a supported custom operator
-            if (op_name.find("DROPOUT") != string::npos || 
-                op_name.find("Dropout") != string::npos ||
-                op_name.find("FLATTEN") != string::npos ||
-                op_name.find("Flatten") != string::npos) {
-                // Supported custom operators
-                break;
-            }
-        }
-        
-        switch (op_code) {
-            case tflite::BuiltinOperator_FULLY_CONNECTED:
-            case tflite::BuiltinOperator_SOFTMAX:
-            case tflite::BuiltinOperator_RELU:
-            case tflite::BuiltinOperator_CONV_2D:
-            case tflite::BuiltinOperator_MAX_POOL_2D:
-            case tflite::BuiltinOperator_SHAPE:
-            case tflite::BuiltinOperator_STRIDED_SLICE:
-            case tflite::BuiltinOperator_PACK:
-            case tflite::BuiltinOperator_RESHAPE:
-                // Supported
-                break;
-            default:
-                cerr << "Error: Unsupported operator '" << op_name
-                     << "' (builtin code " << registration.builtin_code
-                     << ") at node " << node_index << "." << endl;
-                ok = false;
-                continue;
-        }
-
-        // For FULLY_CONNECTED and CONV_2D, validate fused activation
-        if (op_code == tflite::BuiltinOperator_FULLY_CONNECTED) {
-            TfLiteFusedActivation fused_activation = kTfLiteActNone;
-            const void* builtin_data = node.builtin_data;
-            if (builtin_data) {
-                const TfLiteFullyConnectedParams* params =
-                    static_cast<const TfLiteFullyConnectedParams*>(builtin_data);
-                fused_activation = params->activation;
-            }
-
-            if (fused_activation != kTfLiteActNone &&
-                fused_activation != kTfLiteActRelu) {
-                cerr << "Error: Unsupported fused activation (" << fused_activation
-                     << ") in FULLY_CONNECTED node " << node_index
-                     << ". Only NONE and RELU are supported." << endl;
-                ok = false;
-            }
-        } else if (op_code == tflite::BuiltinOperator_CONV_2D) {
-            TfLiteFusedActivation fused_activation = kTfLiteActNone;
-            const void* builtin_data = node.builtin_data;
-            if (builtin_data) {
-                const TfLiteConvParams* params =
-                    static_cast<const TfLiteConvParams*>(builtin_data);
-                fused_activation = params->activation;
-            }
-
-            if (fused_activation != kTfLiteActNone &&
-                fused_activation != kTfLiteActRelu) {
-                cerr << "Error: Unsupported fused activation (" << fused_activation
-                     << ") in CONV_2D node " << node_index
-                     << ". Only NONE and RELU are supported." << endl;
-                ok = false;
-            }
-        }
-    }
-
-    if (!ok) {
-        cerr << "Code generation aborted due to unsupported operators/activations."
-             << endl;
-    }
-
-    return ok;
-}
-
 // Escape identifier for C++
 string EscapeIdentifier(const string& name) {
     string result;
@@ -340,23 +261,40 @@ string EscapeIdentifier(const string& name) {
 }
 
 // Create mapping from tensor index to weight variable name
-map<int, string> CreateWeightMapping(tflite::Interpreter& interpreter) {
+map<int, string> CreateWeightMapping(
+    const tflite::Model* model,
+    const tflite::SubGraph* subgraph
+) {
     map<int, string> tensor_to_weight;
-    const size_t num_tensors = interpreter.tensors_size();
+    const auto* tensors = subgraph->tensors();
+    const auto* buffers = model->buffers();
+    
+    if (!tensors || !buffers) {
+        return tensor_to_weight;
+    }
+    
     int weight_index = 0;
     
-    for (size_t i = 0; i < num_tensors; ++i) {
-        const TfLiteTensor* tensor = interpreter.tensor(i);
+    for (size_t i = 0; i < tensors->size(); ++i) {
+        const tflite::Tensor* tensor = tensors->Get(i);
         if (!tensor) continue;
         
-        // Weights are typically read-only tensors
-        if (tensor->allocation_type == kTfLiteMmapRo || 
-            tensor->allocation_type == kTfLitePersistentRo) {
-            if (tensor->type == kTfLiteFloat32) {
-                string tensor_name = tensor->name ? tensor->name : "tensor_" + to_string(i);
-                tensor_to_weight[static_cast<int>(i)] = "weight_" + to_string(weight_index) + "_" + EscapeIdentifier(tensor_name);
-                weight_index++;
-            }
+        // Weight tensors have a buffer index > 0 (0 is typically empty/unused)
+        uint32_t buffer_index = tensor->buffer();
+        if (buffer_index == 0 || buffer_index >= buffers->size()) {
+            continue;
+        }
+        
+        const tflite::Buffer* buffer = buffers->Get(buffer_index);
+        if (!buffer || !buffer->data()) {
+            continue;
+        }
+        
+        // Only process FLOAT32 weights
+        if (tensor->type() == tflite::TensorType_FLOAT32) {
+            string tensor_name = tensor->name() ? tensor->name()->c_str() : "tensor_" + to_string(i);
+            tensor_to_weight[static_cast<int>(i)] = "weight_" + to_string(weight_index) + "_" + EscapeIdentifier(tensor_name);
+            weight_index++;
         }
     }
     
@@ -367,7 +305,8 @@ map<int, string> CreateWeightMapping(tflite::Interpreter& interpreter) {
 void GenerateWeightsFile(
     const string& output_path,
     const string& base_name,
-    tflite::Interpreter& interpreter,
+    const tflite::Model* model,
+    const tflite::SubGraph* subgraph,
     const map<int, string>& tensor_to_weight
 ) {
     ofstream out(output_path);
@@ -382,29 +321,50 @@ void GenerateWeightsFile(
     out << "#include <cstddef>\n\n";
     out << "namespace embedded_ml {\n\n";
     
-    const size_t num_tensors = interpreter.tensors_size();
+    const auto* tensors = subgraph->tensors();
+    const auto* buffers = model->buffers();
     
-    for (size_t i = 0; i < num_tensors; ++i) {
+    if (!tensors || !buffers) {
+        out << "} // namespace embedded_ml\n";
+        out.close();
+        return;
+    }
+    
+    for (size_t i = 0; i < tensors->size(); ++i) {
         if (tensor_to_weight.find(static_cast<int>(i)) == tensor_to_weight.end()) {
             continue;
         }
         
-        const TfLiteTensor* tensor = interpreter.tensor(i);
+        const tflite::Tensor* tensor = tensors->Get(i);
         if (!tensor) {
             continue;
         }
         
-        const float* data = interpreter.typed_tensor<float>(i);
-        if (!data) {
+        uint32_t buffer_index = tensor->buffer();
+        if (buffer_index == 0 || buffer_index >= buffers->size()) {
             continue;
         }
         
-        const size_t num_elements = CalculateTensorSize(tensor->dims);
-        string tensor_name = tensor->name ? tensor->name : "tensor_" + to_string(i);
+        const tflite::Buffer* buffer = buffers->Get(buffer_index);
+        if (!buffer || !buffer->data()) {
+            continue;
+        }
+        
+        const size_t num_elements = CalculateTensorSize(tensor->shape());
+        string tensor_name = tensor->name() ? tensor->name()->c_str() : "tensor_" + to_string(i);
         string var_name = tensor_to_weight.at(static_cast<int>(i));
         
+        // Get buffer data
+        const flatbuffers::Vector<uint8_t>* data_vec = buffer->data();
+        if (!data_vec || data_vec->size() < num_elements * sizeof(float)) {
+            cerr << "Warning: Buffer size mismatch for tensor " << i << endl;
+            continue;
+        }
+        
+        const float* data = reinterpret_cast<const float*>(data_vec->data());
+        
         out << "// Weight tensor " << i << ": " << tensor_name << "\n";
-        out << "// Shape: [" << GetShapeString(tensor->dims) << "]\n";
+        out << "// Shape: [" << GetShapeString(tensor->shape()) << "]\n";
         out << "// Elements: " << num_elements << "\n";
         out << "static const float " << var_name << "[" << num_elements << "] = {\n";
         out << fixed << setprecision(9);
@@ -495,13 +455,39 @@ void GenerateModelHeader(
     cout << "Generated: " << output_path << endl;
 }
 
+// Convert FlatBuffer activation to TfLite activation enum
+TfLiteFusedActivation ConvertActivation(tflite::ActivationFunctionType activation) {
+    switch (activation) {
+        case tflite::ActivationFunctionType_NONE: return kTfLiteActNone;
+        case tflite::ActivationFunctionType_RELU: return kTfLiteActRelu;
+        case tflite::ActivationFunctionType_RELU_N1_TO_1: return kTfLiteActReluN1To1;
+        case tflite::ActivationFunctionType_RELU6: return kTfLiteActRelu6;
+        case tflite::ActivationFunctionType_TANH: return kTfLiteActTanh;
+        case tflite::ActivationFunctionType_SIGN_BIT: return kTfLiteActSignBit;
+        default: return kTfLiteActNone;
+    }
+}
+
+// Convert FlatBuffer padding to TfLite padding enum
+TfLitePadding ConvertPadding(tflite::Padding padding) {
+    switch (padding) {
+        case tflite::Padding_SAME: return kTfLitePaddingSame;
+        case tflite::Padding_VALID: return kTfLitePaddingValid;
+        default: return kTfLitePaddingSame;
+    }
+}
+
 // Generate model.cpp
 void GenerateModelFile(
     const string& output_path,
     const string& base_name,
-    tflite::Interpreter& interpreter,
+    const tflite::Model* model,
+    const tflite::SubGraph* subgraph,
     const map<int, string>& tensor_to_weight,
-    const vector<pair<int, size_t>>& intermediate_buffers
+    const vector<pair<int, size_t>>& intermediate_buffers,
+    const map<int, size_t>& tensor_sizes,
+    int32_t input_tensor_idx,
+    int32_t output_tensor_idx
 ) {
     ofstream out(output_path);
     if (!out) {
@@ -518,6 +504,15 @@ void GenerateModelFile(
     out << "#include \"" << base_name << "_weights.cpp\"\n";
     out << "#include \"../../components/fully_connected.h\"\n";
     
+    const auto* operators = subgraph->operators();
+    const auto* operator_codes = model->operator_codes();
+    const auto* tensors = subgraph->tensors();
+    
+    if (!operators || !operator_codes || !tensors) {
+        cerr << "Error: Invalid model structure" << endl;
+        return;
+    }
+    
     // Check which components are needed
     bool has_standalone_relu = false;
     bool has_conv2d = false;
@@ -529,33 +524,39 @@ void GenerateModelFile(
     bool has_dropout = false;
     bool has_flatten = false;
     
-    const auto& execution_plan_check = interpreter.execution_plan();
-    for (size_t i = 0; i < execution_plan_check.size(); ++i) {
-        const int node_index = execution_plan_check[i];
-        const auto* node_and_reg = interpreter.node_and_registration(node_index);
-        if (node_and_reg) {
-            string op_name = GetOperatorName(interpreter, node_index);
-            if (op_name == "RELU") {
-                has_standalone_relu = true;
-            } else if (op_name == "CONV_2D") {
-                has_conv2d = true;
-            } else if (op_name == "MAX_POOL_2D") {
-                has_max_pool2d = true;
-            } else if (op_name == "SHAPE") {
-                has_shape = true;
-            } else if (op_name == "STRIDED_SLICE") {
-                has_strided_slice = true;
-            } else if (op_name == "PACK") {
-                has_pack = true;
-            } else if (op_name == "RESHAPE") {
-                has_reshape = true;
-            } else if (op_name.find("DROPOUT") != string::npos || 
-                       op_name.find("Dropout") != string::npos) {
-                has_dropout = true;
-            } else if (op_name.find("FLATTEN") != string::npos ||
-                       op_name.find("Flatten") != string::npos) {
-                has_flatten = true;
-            }
+    for (size_t i = 0; i < operators->size(); ++i) {
+        const tflite::Operator* op = operators->Get(i);
+        if (!op) continue;
+        
+        int op_code_index = op->opcode_index();
+        if (op_code_index < 0 || op_code_index >= static_cast<int>(operator_codes->size())) {
+            continue;
+        }
+        
+        const tflite::OperatorCode* op_code = operator_codes->Get(op_code_index);
+        if (!op_code) continue;
+        
+        string op_name = GetOperatorName(op_code);
+        if (op_name == "RELU") {
+            has_standalone_relu = true;
+        } else if (op_name == "CONV_2D") {
+            has_conv2d = true;
+        } else if (op_name == "MAX_POOL_2D") {
+            has_max_pool2d = true;
+        } else if (op_name == "SHAPE") {
+            has_shape = true;
+        } else if (op_name == "STRIDED_SLICE") {
+            has_strided_slice = true;
+        } else if (op_name == "PACK") {
+            has_pack = true;
+        } else if (op_name == "RESHAPE") {
+            has_reshape = true;
+        } else if (op_name.find("DROPOUT") != string::npos || 
+                   op_name.find("Dropout") != string::npos) {
+            has_dropout = true;
+        } else if (op_name.find("FLATTEN") != string::npos ||
+                   op_name.find("Flatten") != string::npos) {
+            has_flatten = true;
         }
     }
     
@@ -592,121 +593,70 @@ void GenerateModelFile(
     
     out << "namespace embedded_ml {\n\n";
     
-    // Get input/output shapes
-    const auto& input_indices = interpreter.inputs();
-    const auto& output_indices = interpreter.outputs();
-    
-    if (input_indices.size() != 1 || output_indices.size() != 1) {
-        cerr << "Error: Only single input/output models supported" << endl;
-        return;
-    }
-    
-    const TfLiteTensor* input_tensor = interpreter.tensor(input_indices[0]);
-    const TfLiteTensor* output_tensor = interpreter.tensor(output_indices[0]);
-    
-    if (!input_tensor || !output_tensor) {
-        cerr << "Error: Cannot access input/output tensors" << endl;
-        return;
-    }
-    
-    size_t input_size = CalculateTensorSize(input_tensor->dims);
-    size_t output_size = CalculateTensorSize(output_tensor->dims);
-    
-    // Track all tensor sizes first
-    map<int, size_t> tensor_sizes;
-    tensor_sizes[input_indices[0]] = input_size;
-    tensor_sizes[output_indices[0]] = output_size;
-    
-    // Process execution plan to find all intermediate tensors
-    const auto& execution_plan = interpreter.execution_plan();
-    set<string> used_components;
-    
-    // First pass: collect all tensor sizes
-    for (size_t i = 0; i < execution_plan.size(); ++i) {
-        const int node_index = execution_plan[i];
-        const auto* node_and_reg = interpreter.node_and_registration(node_index);
-        if (!node_and_reg) continue;
-        
-        const auto& node = node_and_reg->first;
-        if (node.inputs && node.inputs->size > 0) {
-            for (int j = 0; j < node.inputs->size; ++j) {
-                int tensor_idx = node.inputs->data[j];
-                const TfLiteTensor* tensor = interpreter.tensor(tensor_idx);
-                if (tensor && tensor_sizes.find(tensor_idx) == tensor_sizes.end()) {
-                    tensor_sizes[tensor_idx] = CalculateTensorSize(tensor->dims);
-                }
-            }
-        }
-        if (node.outputs && node.outputs->size > 0) {
-            for (int j = 0; j < node.outputs->size; ++j) {
-                int tensor_idx = node.outputs->data[j];
-                const TfLiteTensor* tensor = interpreter.tensor(tensor_idx);
-                if (tensor && tensor_sizes.find(tensor_idx) == tensor_sizes.end()) {
-                    tensor_sizes[tensor_idx] = CalculateTensorSize(tensor->dims);
-                }
-            }
-        }
-    }
-    
     // Implementation of Inference method
-    // (intermediate_buffers are passed in and already calculated)
     out << "void " << base_name << "Model::Inference(const float* input, float* output) {\n";
     
-    // Process each layer
-    for (size_t i = 0; i < execution_plan.size(); ++i) {
-        const int node_index = execution_plan[i];
-        const auto* node_and_reg = interpreter.node_and_registration(node_index);
-        if (!node_and_reg) continue;
+    // Process each operator in order (this is the execution plan)
+    for (size_t i = 0; i < operators->size(); ++i) {
+        const tflite::Operator* op = operators->Get(i);
+        if (!op) continue;
         
-        const auto& node = node_and_reg->first;
-        const auto& registration = node_and_reg->second;
-        string op_name = GetOperatorName(interpreter, node_index);
+        int op_code_index = op->opcode_index();
+        if (op_code_index < 0 || op_code_index >= static_cast<int>(operator_codes->size())) {
+            continue;
+        }
+        
+        const tflite::OperatorCode* op_code = operator_codes->Get(op_code_index);
+        if (!op_code) continue;
+        
+        string op_name = GetOperatorName(op_code);
         
         out << "        // Layer " << i << ": " << op_name << "\n";
         
         // Get input/output tensor indices
-        int input_tensor_idx = -1;
-        int output_tensor_idx = -1;
+        const auto* op_inputs = op->inputs();
+        const auto* op_outputs = op->outputs();
         
-        if (node.inputs && node.inputs->size > 0) {
-            input_tensor_idx = node.inputs->data[0];
+        int op_input_tensor_idx = -1;
+        int op_output_tensor_idx = -1;
+        
+        if (op_inputs && op_inputs->size() > 0) {
+            op_input_tensor_idx = op_inputs->Get(0);
         }
-        if (node.outputs && node.outputs->size > 0) {
-            output_tensor_idx = node.outputs->data[0];
+        if (op_outputs && op_outputs->size() > 0) {
+            op_output_tensor_idx = op_outputs->Get(0);
         }
         
-        if (input_tensor_idx < 0 || output_tensor_idx < 0) {
+        if (op_input_tensor_idx < 0 || op_output_tensor_idx < 0) {
             continue;
         }
         
         // Determine input/output pointers
         string input_ptr, output_ptr;
-        if (input_tensor_idx == input_indices[0]) {
+        if (op_input_tensor_idx == input_tensor_idx) {
             input_ptr = "input";
         } else {
-            input_ptr = "buffer_" + to_string(input_tensor_idx);
+            input_ptr = "buffer_" + to_string(op_input_tensor_idx);
         }
         
-        if (output_tensor_idx == output_indices[0]) {
+        if (op_output_tensor_idx == output_tensor_idx) {
             output_ptr = "output";
         } else {
-            output_ptr = "buffer_" + to_string(output_tensor_idx);
+            output_ptr = "buffer_" + to_string(op_output_tensor_idx);
         }
         
-        size_t input_size_layer = tensor_sizes.count(input_tensor_idx) ? tensor_sizes[input_tensor_idx] : 0;
-        size_t output_size_layer = tensor_sizes.count(output_tensor_idx) ? tensor_sizes[output_tensor_idx] : 0;
+        size_t input_size_layer = tensor_sizes.count(op_input_tensor_idx) ? tensor_sizes.at(op_input_tensor_idx) : 0;
+        size_t output_size_layer = tensor_sizes.count(op_output_tensor_idx) ? tensor_sizes.at(op_output_tensor_idx) : 0;
         
         // Generate code based on operation
         if (op_name == "FULLY_CONNECTED") {
-            used_components.insert("fully_connected");
-            
             // Find weights and bias
             int weights_tensor_idx = -1;
             int bias_tensor_idx = -1;
             
-            if (node.inputs && node.inputs->size >= 3) {
-                weights_tensor_idx = node.inputs->data[1];
-                bias_tensor_idx = node.inputs->data[2];
+            if (op_inputs && op_inputs->size() >= 3) {
+                weights_tensor_idx = op_inputs->Get(1);
+                bias_tensor_idx = op_inputs->Get(2);
             }
             
             if (weights_tensor_idx >= 0 && bias_tensor_idx >= 0) {
@@ -720,21 +670,20 @@ void GenerateModelFile(
                 string bias_var = tensor_to_weight.at(bias_tensor_idx);
                 
                 // Determine actual input size from weights shape
-                const TfLiteTensor* weights_tensor = interpreter.tensor(weights_tensor_idx);
                 size_t fc_input_size = input_size_layer;
-                if (weights_tensor && weights_tensor->dims && weights_tensor->dims->size >= 2) {
-                    fc_input_size = weights_tensor->dims->data[1]; // weights shape: [output, input]
+                if (weights_tensor_idx >= 0 && weights_tensor_idx < static_cast<int>(tensors->size())) {
+                    const tflite::Tensor* weights_tensor = tensors->Get(weights_tensor_idx);
+                    if (weights_tensor && weights_tensor->shape() && weights_tensor->shape()->size() >= 2) {
+                        fc_input_size = weights_tensor->shape()->Get(1); // weights shape: [output, input]
+                    }
                 }
                 
                 // Check for fused activation function
                 TfLiteFusedActivation fused_activation = kTfLiteActNone;
-                if (registration.builtin_code == tflite::BuiltinOperator_FULLY_CONNECTED) {
-                    const void* builtin_data = node.builtin_data;
-                    if (builtin_data) {
-                        const TfLiteFullyConnectedParams* params = 
-                            static_cast<const TfLiteFullyConnectedParams*>(builtin_data);
-                        fused_activation = params->activation;
-                    }
+                const tflite::FullyConnectedOptions* options = 
+                    op->builtin_options_as_FullyConnectedOptions();
+                if (options) {
+                    fused_activation = ConvertActivation(options->fused_activation_function());
                 }
                 
                 // Determine activation parameter
@@ -742,7 +691,7 @@ void GenerateModelFile(
                 if (fused_activation == kTfLiteActRelu) {
                     activation_param = "ActivationType::RELU";
                 } else if (fused_activation != kTfLiteActNone) {
-                    cerr << "Warning: Unsupported fused activation " << fused_activation 
+                    cerr << "Warning: Unsupported fused activation " << static_cast<int>(fused_activation) 
                          << " in FULLY_CONNECTED layer " << i << " (only ReLU supported, using NONE)" << endl;
                 }
                 
@@ -754,23 +703,19 @@ void GenerateModelFile(
                 cerr << "Warning: FULLY_CONNECTED layer " << i << " missing weights/bias" << endl;
             }
         } else if (op_name == "RELU") {
-            used_components.insert("relu");
             out << "        ReLU(" << input_ptr << ", " << output_ptr << ", " 
                 << output_size_layer << ");\n";
         } else if (op_name == "SOFTMAX") {
-            used_components.insert("softmax");
             out << "        Softmax(" << input_ptr << ", " << output_ptr << ", " 
                 << output_size_layer << ");\n";
         } else if (op_name == "CONV_2D") {
-            used_components.insert("conv_2d");
-            
             // CONV_2D has inputs: [input, filter, bias]
             int filter_tensor_idx = -1;
             int bias_tensor_idx = -1;
             
-            if (node.inputs && node.inputs->size >= 3) {
-                filter_tensor_idx = node.inputs->data[1];
-                bias_tensor_idx = node.inputs->data[2];
+            if (op_inputs && op_inputs->size() >= 3) {
+                filter_tensor_idx = op_inputs->Get(1);
+                bias_tensor_idx = op_inputs->Get(2);
             }
             
             if (filter_tensor_idx >= 0 && bias_tensor_idx >= 0) {
@@ -784,26 +729,29 @@ void GenerateModelFile(
                 string bias_var = tensor_to_weight.at(bias_tensor_idx);
                 
                 // Get tensor shapes
-                const TfLiteTensor* input_tensor = interpreter.tensor(input_tensor_idx);
-                const TfLiteTensor* filter_tensor = interpreter.tensor(filter_tensor_idx);
-                const TfLiteTensor* output_tensor = interpreter.tensor(output_tensor_idx);
+                const tflite::Tensor* input_tensor = (op_input_tensor_idx >= 0 && op_input_tensor_idx < static_cast<int>(tensors->size())) 
+                    ? tensors->Get(op_input_tensor_idx) : nullptr;
+                const tflite::Tensor* filter_tensor = (filter_tensor_idx >= 0 && filter_tensor_idx < static_cast<int>(tensors->size()))
+                    ? tensors->Get(filter_tensor_idx) : nullptr;
+                const tflite::Tensor* output_tensor = (op_output_tensor_idx >= 0 && op_output_tensor_idx < static_cast<int>(tensors->size()))
+                    ? tensors->Get(op_output_tensor_idx) : nullptr;
                 
                 if (!input_tensor || !filter_tensor || !output_tensor ||
-                    !input_tensor->dims || !filter_tensor->dims || !output_tensor->dims) {
+                    !input_tensor->shape() || !filter_tensor->shape() || !output_tensor->shape()) {
                     cerr << "Warning: Cannot get tensor shapes for CONV_2D layer " << i << endl;
                     continue;
                 }
                 
                 // Extract dimensions (NHWC format)
-                size_t batch_size = input_tensor->dims->data[0];
-                size_t input_height = input_tensor->dims->data[1];
-                size_t input_width = input_tensor->dims->data[2];
-                size_t input_channels = input_tensor->dims->data[3];
-                size_t filter_height = filter_tensor->dims->data[1];
-                size_t filter_width = filter_tensor->dims->data[2];
-                size_t output_channels = filter_tensor->dims->data[0];
-                size_t output_height = output_tensor->dims->data[1];
-                size_t output_width = output_tensor->dims->data[2];
+                size_t batch_size = input_tensor->shape()->Get(0);
+                size_t input_height = input_tensor->shape()->Get(1);
+                size_t input_width = input_tensor->shape()->Get(2);
+                size_t input_channels = input_tensor->shape()->Get(3);
+                size_t filter_height = filter_tensor->shape()->Get(1);
+                size_t filter_width = filter_tensor->shape()->Get(2);
+                size_t output_channels = filter_tensor->shape()->Get(0);
+                size_t output_height = output_tensor->shape()->Get(1);
+                size_t output_width = output_tensor->shape()->Get(2);
                 
                 // Get convolution parameters
                 TfLitePadding padding = kTfLitePaddingSame;
@@ -813,16 +761,14 @@ void GenerateModelFile(
                 int dilation_height = 1;
                 int dilation_width = 1;
                 
-                const void* builtin_data = node.builtin_data;
-                if (builtin_data) {
-                    const TfLiteConvParams* params = 
-                        static_cast<const TfLiteConvParams*>(builtin_data);
-                    padding = params->padding;
-                    stride_height = params->stride_height;
-                    stride_width = params->stride_width;
-                    fused_activation = params->activation;
-                    dilation_height = params->dilation_height_factor;
-                    dilation_width = params->dilation_width_factor;
+                const tflite::Conv2DOptions* options = op->builtin_options_as_Conv2DOptions();
+                if (options) {
+                    padding = ConvertPadding(options->padding());
+                    stride_height = options->stride_h();
+                    stride_width = options->stride_w();
+                    fused_activation = ConvertActivation(options->fused_activation_function());
+                    dilation_height = options->dilation_h_factor();
+                    dilation_width = options->dilation_w_factor();
                 }
                 
                 string padding_param = (padding == kTfLitePaddingSame) ? 
@@ -841,23 +787,23 @@ void GenerateModelFile(
                 cerr << "Warning: CONV_2D layer " << i << " missing filter/bias" << endl;
             }
         } else if (op_name == "MAX_POOL_2D") {
-            used_components.insert("max_pool_2d");
-            
             // Get tensor shapes
-            const TfLiteTensor* input_tensor = interpreter.tensor(input_tensor_idx);
-            const TfLiteTensor* output_tensor = interpreter.tensor(output_tensor_idx);
+            const tflite::Tensor* input_tensor = (op_input_tensor_idx >= 0 && op_input_tensor_idx < static_cast<int>(tensors->size()))
+                ? tensors->Get(op_input_tensor_idx) : nullptr;
+            const tflite::Tensor* output_tensor = (op_output_tensor_idx >= 0 && op_output_tensor_idx < static_cast<int>(tensors->size()))
+                ? tensors->Get(op_output_tensor_idx) : nullptr;
             
             if (!input_tensor || !output_tensor ||
-                !input_tensor->dims || !output_tensor->dims) {
+                !input_tensor->shape() || !output_tensor->shape()) {
                 cerr << "Warning: Cannot get tensor shapes for MAX_POOL_2D layer " << i << endl;
                 continue;
             }
             
             // Extract dimensions (NHWC format)
-            size_t batch_size = input_tensor->dims->data[0];
-            size_t input_height = input_tensor->dims->data[1];
-            size_t input_width = input_tensor->dims->data[2];
-            size_t channels = input_tensor->dims->data[3];
+            size_t batch_size = input_tensor->shape()->Get(0);
+            size_t input_height = input_tensor->shape()->Get(1);
+            size_t input_width = input_tensor->shape()->Get(2);
+            size_t channels = input_tensor->shape()->Get(3);
             
             // Get pooling parameters
             TfLitePadding padding = kTfLitePaddingSame;
@@ -867,16 +813,14 @@ void GenerateModelFile(
             int filter_width = 2;
             TfLiteFusedActivation fused_activation = kTfLiteActNone;
             
-            const void* builtin_data = node.builtin_data;
-            if (builtin_data) {
-                const TfLitePoolParams* params = 
-                    static_cast<const TfLitePoolParams*>(builtin_data);
-                padding = params->padding;
-                stride_height = params->stride_height;
-                stride_width = params->stride_width;
-                filter_height = params->filter_height;
-                filter_width = params->filter_width;
-                fused_activation = params->activation;
+            const tflite::Pool2DOptions* options = op->builtin_options_as_Pool2DOptions();
+            if (options) {
+                padding = ConvertPadding(options->padding());
+                stride_height = options->stride_h();
+                stride_width = options->stride_w();
+                filter_height = options->filter_height();
+                filter_width = options->filter_width();
+                fused_activation = ConvertActivation(options->fused_activation_function());
             }
             
             string padding_param = (padding == kTfLitePaddingSame) ? 
@@ -890,51 +834,37 @@ void GenerateModelFile(
                 << stride_height << ", " << stride_width << ", "
                 << padding_param << ", " << activation_param << ");\n";
         } else if (op_name == "SHAPE") {
-            used_components.insert("shape");
-            
             // SHAPE extracts the shape of the input tensor
-            const TfLiteTensor* input_tensor = interpreter.tensor(input_tensor_idx);
-            const TfLiteTensor* output_tensor = interpreter.tensor(output_tensor_idx);
+            const tflite::Tensor* input_tensor = (op_input_tensor_idx >= 0 && op_input_tensor_idx < static_cast<int>(tensors->size()))
+                ? tensors->Get(op_input_tensor_idx) : nullptr;
             
-            if (!input_tensor || !output_tensor || !input_tensor->dims) {
+            if (!input_tensor || !input_tensor->shape()) {
                 cerr << "Warning: Cannot get tensor shapes for SHAPE layer " << i << endl;
                 continue;
             }
             
-            int num_dims = input_tensor->dims->size;
+            int num_dims = input_tensor->shape()->size();
             out << "        // SHAPE: Extract shape from input tensor\n";
             out << "        {\n";
             out << "            int32_t input_shape[" << num_dims << "] = {";
             for (int j = 0; j < num_dims; ++j) {
-                out << input_tensor->dims->data[j];
+                out << input_tensor->shape()->Get(j);
                 if (j < num_dims - 1) out << ", ";
             }
             out << "};\n";
             out << "            Shape(input_shape, " << num_dims << ", reinterpret_cast<int32_t*>(" << output_ptr << "));\n";
             out << "        }\n";
         } else if (op_name == "STRIDED_SLICE") {
-            used_components.insert("strided_slice");
-            
             // STRIDED_SLICE has inputs: [input, begin, end, strides]
-            // For simplicity, we'll extract the values from constant tensors
-            const TfLiteTensor* input_tensor = interpreter.tensor(input_tensor_idx);
-            const TfLiteTensor* output_tensor = interpreter.tensor(output_tensor_idx);
+            const tflite::Tensor* input_tensor = (op_input_tensor_idx >= 0 && op_input_tensor_idx < static_cast<int>(tensors->size()))
+                ? tensors->Get(op_input_tensor_idx) : nullptr;
+            const tflite::Tensor* output_tensor = (op_output_tensor_idx >= 0 && op_output_tensor_idx < static_cast<int>(tensors->size()))
+                ? tensors->Get(op_output_tensor_idx) : nullptr;
             
             if (!input_tensor || !output_tensor ||
-                !input_tensor->dims || !output_tensor->dims) {
+                !input_tensor->shape() || !output_tensor->shape()) {
                 cerr << "Warning: Cannot get tensor shapes for STRIDED_SLICE layer " << i << endl;
                 continue;
-            }
-            
-            // Get begin, end, strides from input tensors
-            int begin_tensor_idx = -1;
-            int end_tensor_idx = -1;
-            int strides_tensor_idx = -1;
-            
-            if (node.inputs && node.inputs->size >= 4) {
-                begin_tensor_idx = node.inputs->data[1];
-                end_tensor_idx = node.inputs->data[2];
-                strides_tensor_idx = node.inputs->data[3];
             }
             
             // Extract parameters
@@ -942,17 +872,14 @@ void GenerateModelFile(
             int end_mask = 0;
             int shrink_axis_mask = 0;
             
-            const void* builtin_data = node.builtin_data;
-            if (builtin_data) {
-                const TfLiteStridedSliceParams* params = 
-                    static_cast<const TfLiteStridedSliceParams*>(builtin_data);
-                begin_mask = params->begin_mask;
-                end_mask = params->end_mask;
-                shrink_axis_mask = params->shrink_axis_mask;
+            const tflite::StridedSliceOptions* options = op->builtin_options_as_StridedSliceOptions();
+            if (options) {
+                begin_mask = options->begin_mask();
+                end_mask = options->end_mask();
+                shrink_axis_mask = options->shrink_axis_mask();
             }
             
             // For now, generate a simplified version
-            // In a full implementation, we'd extract begin/end/strides from tensors
             out << "        // STRIDED_SLICE: Extract slice from input\n";
             out << "        // Note: This is a simplified implementation\n";
             out << "        // Full implementation would extract begin/end/strides from input tensors\n";
@@ -961,61 +888,47 @@ void GenerateModelFile(
             out << "            " << output_ptr << "[j] = " << input_ptr << "[j];\n";
             out << "        }\n";
         } else if (op_name == "PACK") {
-            used_components.insert("pack");
-            
             // PACK has multiple inputs to pack along an axis
-            const TfLiteTensor* output_tensor = interpreter.tensor(output_tensor_idx);
+            const tflite::Tensor* output_tensor = (op_output_tensor_idx >= 0 && op_output_tensor_idx < static_cast<int>(tensors->size()))
+                ? tensors->Get(op_output_tensor_idx) : nullptr;
             
-            if (!output_tensor || !output_tensor->dims) {
+            if (!output_tensor || !output_tensor->shape()) {
                 cerr << "Warning: Cannot get tensor shapes for PACK layer " << i << endl;
                 continue;
             }
             
             // Get axis parameter
             int axis = 0;
-            const void* builtin_data = node.builtin_data;
-            if (builtin_data) {
-                const TfLitePackParams* params = 
-                    static_cast<const TfLitePackParams*>(builtin_data);
-                axis = params->axis;
+            const tflite::PackOptions* options = op->builtin_options_as_PackOptions();
+            if (options) {
+                axis = options->axis();
             }
             
             // For simplicity, generate code that packs inputs
-            // In a full implementation, we'd handle multiple input tensors
             out << "        // PACK: Pack multiple inputs along axis " << axis << "\n";
             out << "        // Note: This is a simplified implementation\n";
             out << "        // Full implementation would handle multiple input tensors\n";
-            if (node.inputs && node.inputs->size > 0) {
+            if (op_inputs && op_inputs->size() > 0) {
                 out << "        // Copying first input to output as placeholder\n";
                 out << "        for (size_t j = 0; j < " << output_size_layer << "; ++j) {\n";
                 out << "            " << output_ptr << "[j] = " << input_ptr << "[j];\n";
                 out << "        }\n";
             }
         } else if (op_name == "RESHAPE") {
-            used_components.insert("reshape");
-            
             // RESHAPE just copies data (memory layout is the same)
             out << "        Reshape(" << input_ptr << ", " << input_size_layer 
                 << ", " << output_ptr << ", " << output_size_layer << ");\n";
         } else if (op_name.find("DROPOUT") != string::npos || 
                    op_name.find("Dropout") != string::npos) {
-            used_components.insert("dropout");
-            
             // Get dropout rate if available (though it's ignored during inference)
             float dropout_rate = 0.0f;
-            const void* builtin_data = node.builtin_data;
-            // Note: Dropout typically doesn't have builtin_data in TFLite
-            // as it's usually removed or converted during conversion
             
             out << "        // DROPOUT: No-op during inference (passes through input)\n";
             out << "        Dropout(" << input_ptr << ", " << output_ptr << ", " 
                 << output_size_layer << ", " << dropout_rate << "f);\n";
         } else if (op_name.find("FLATTEN") != string::npos ||
                    op_name.find("Flatten") != string::npos) {
-            used_components.insert("flatten");
-            
             // FLATTEN is essentially a reshape to 1D (except batch dimension)
-            // For our purposes, it's the same as Reshape
             out << "        // FLATTEN: Flatten multi-dimensional tensor to 1D\n";
             out << "        Flatten(" << input_ptr << ", " << input_size_layer 
                 << ", " << output_ptr << ", " << output_size_layer << ");\n";
@@ -1044,7 +957,9 @@ void GenerateModelFile(
 void GenerateInferenceFile(
     const string& output_path,
     const string& base_name,
-    tflite::Interpreter& interpreter
+    const tflite::SubGraph* subgraph,
+    int32_t input_tensor_idx,
+    int32_t output_tensor_idx
 ) {
     ofstream out(output_path);
     if (!out) {
@@ -1052,25 +967,24 @@ void GenerateInferenceFile(
         return;
     }
     
-    // Get input/output shapes
-    const auto& input_indices = interpreter.inputs();
-    const auto& output_indices = interpreter.outputs();
-    
-    if (input_indices.size() != 1 || output_indices.size() != 1) {
-        cerr << "Error: Only single input/output models supported" << endl;
+    const auto* tensors = subgraph->tensors();
+    if (!tensors) {
+        cerr << "Error: Cannot access tensors" << endl;
         return;
     }
     
-    const TfLiteTensor* input_tensor = interpreter.tensor(input_indices[0]);
-    const TfLiteTensor* output_tensor = interpreter.tensor(output_indices[0]);
+    const tflite::Tensor* input_tensor = (input_tensor_idx >= 0 && input_tensor_idx < static_cast<int>(tensors->size()))
+        ? tensors->Get(input_tensor_idx) : nullptr;
+    const tflite::Tensor* output_tensor = (output_tensor_idx >= 0 && output_tensor_idx < static_cast<int>(tensors->size()))
+        ? tensors->Get(output_tensor_idx) : nullptr;
     
     if (!input_tensor || !output_tensor) {
         cerr << "Error: Cannot access input/output tensors" << endl;
         return;
     }
     
-    size_t input_size = CalculateTensorSize(input_tensor->dims);
-    size_t output_size = CalculateTensorSize(output_tensor->dims);
+    size_t input_size = CalculateTensorSize(input_tensor->shape());
+    size_t output_size = CalculateTensorSize(output_tensor->shape());
     
     out << "// " << base_name << "_inference.cpp\n";
     out << "// Example inference code - edit this file to match your specific inference needs\n";
@@ -1086,7 +1000,7 @@ void GenerateInferenceFile(
     
     out << "int main() {\n";
     out << "    // Example input data matching the model's input shape\n";
-    out << "    // Shape: [" << GetShapeString(input_tensor->dims) << "]\n";
+    out << "    // Shape: [" << GetShapeString(input_tensor->shape()) << "]\n";
     out << "    // TODO: Replace this with your actual input data\n";
     out << "    float input[" << base_name << "Model::kInputSize] = {\n";
     
@@ -1108,7 +1022,7 @@ void GenerateInferenceFile(
     out << "    };\n\n";
     
     out << "    // Output array to store inference results\n";
-    out << "    // Shape: [" << GetShapeString(output_tensor->dims) << "]\n";
+    out << "    // Shape: [" << GetShapeString(output_tensor->shape()) << "]\n";
     out << "    float output[" << base_name << "Model::kOutputSize];\n\n";
     
     out << "    // Run inference\n";
@@ -1227,75 +1141,91 @@ int main(int argc, char* argv[]) {
     
     cout << "Loading TFLite model from: " << model_path << endl;
     
-    // Load the model
-    unique_ptr<tflite::FlatBufferModel> model = 
-        tflite::FlatBufferModel::BuildFromFile(model_path.c_str());
+    // Read the entire file into memory
+    ifstream file(model_path, ios::binary | ios::ate);
+    if (!file.is_open()) {
+        cerr << "Error: Failed to open file: " << model_path << endl;
+        return 1;
+    }
     
+    streamsize file_size = file.tellg();
+    file.seekg(0, ios::beg);
+    
+    vector<uint8_t> buffer(file_size);
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), file_size)) {
+        cerr << "Error: Failed to read file: " << model_path << endl;
+        return 1;
+    }
+    file.close();
+    
+    cout << "File read successfully (" << file_size << " bytes)" << endl;
+    
+    // Verify FlatBuffer
+    flatbuffers::Verifier verifier(buffer.data(), buffer.size());
+    if (!tflite::VerifyModelBuffer(verifier)) {
+        cerr << "Error: Invalid FlatBuffer format" << endl;
+        return 1;
+    }
+    
+    // Get the model from the FlatBuffer
+    const tflite::Model* model = tflite::GetModel(buffer.data());
     if (!model) {
-        cerr << "Error: Failed to load model from " << model_path << endl;
+        cerr << "Error: Failed to parse model from FlatBuffer" << endl;
         return 1;
     }
     
     cout << "Model loaded successfully!" << endl;
     
-    // Validate model schema BEFORE building interpreter
-    // This provides clear error messages for unsupported operations
+    // Validate model schema
     cout << "Validating model operations..." << endl;
-    if (!ValidateModelSchema(*model)) {
+    if (!ValidateModelSchema(model)) {
         return 1;
     }
     cout << "Model validation passed - all operations are supported!" << endl;
     
-    // Build the interpreter
-    tflite::MutableOpResolver resolver;
-    resolver.AddBuiltin(tflite::BuiltinOperator_FULLY_CONNECTED,
-        tflite::ops::builtin::Register_FULLY_CONNECTED());
-    resolver.AddBuiltin(tflite::BuiltinOperator_SOFTMAX,
-        tflite::ops::builtin::Register_SOFTMAX());
-    resolver.AddBuiltin(tflite::BuiltinOperator_RELU,
-        tflite::ops::builtin::Register_RELU());
-    resolver.AddBuiltin(tflite::BuiltinOperator_CONV_2D,
-        tflite::ops::builtin::Register_CONV_2D());
-    resolver.AddBuiltin(tflite::BuiltinOperator_MAX_POOL_2D,
-        tflite::ops::builtin::Register_MAX_POOL_2D());
-    resolver.AddBuiltin(tflite::BuiltinOperator_SHAPE,
-        tflite::ops::builtin::Register_SHAPE());
-    resolver.AddBuiltin(tflite::BuiltinOperator_STRIDED_SLICE,
-        tflite::ops::builtin::Register_STRIDED_SLICE());
-    resolver.AddBuiltin(tflite::BuiltinOperator_PACK,
-        tflite::ops::builtin::Register_PACK());
-    resolver.AddBuiltin(tflite::BuiltinOperator_RESHAPE,
-        tflite::ops::builtin::Register_RESHAPE());
-    
-    unique_ptr<tflite::Interpreter> interpreter;
-    
-    tflite::InterpreterBuilder builder(*model, resolver);
-    if (builder(&interpreter) != kTfLiteOk) {
-        cerr << "\nError: Failed to construct interpreter." << endl;
-        cerr << "This may indicate an issue with the model structure." << endl;
-        cerr << "Note: Model operations were validated, but interpreter construction failed." << endl;
-        cerr << "This could be due to an internal TFLite error or model format issue." << endl;
+    // Get the main subgraph
+    const auto* subgraphs = model->subgraphs();
+    if (!subgraphs || subgraphs->size() == 0) {
+        cerr << "Error: No subgraphs found in model" << endl;
         return 1;
     }
     
-    if (!interpreter) {
-        cerr << "\nError: Interpreter is null after construction." << endl;
+    const tflite::SubGraph* subgraph = subgraphs->Get(0);
+    if (!subgraph) {
+        cerr << "Error: Subgraph is null" << endl;
         return 1;
     }
     
-    // Allocate tensors
-    if (interpreter->AllocateTensors() != kTfLiteOk) {
-        cerr << "\nError: Failed to allocate tensors." << endl;
-        cerr << "This may indicate a memory issue or invalid tensor configuration." << endl;
+    const auto* inputs = subgraph->inputs();
+    const auto* outputs = subgraph->outputs();
+    const auto* tensors = subgraph->tensors();
+    const auto* operators = subgraph->operators();
+    
+    if (!inputs || !outputs || !tensors || inputs->size() == 0 || outputs->size() == 0) {
+        cerr << "Error: Invalid model structure - missing inputs/outputs" << endl;
         return 1;
     }
     
-    cout << "Interpreter initialized successfully!" << endl;
-
-    // Validate that the model only uses supported operators/activations
-    if (!ValidateModel(*interpreter)) {
+    if (inputs->size() != 1 || outputs->size() != 1) {
+        cerr << "Error: Only single input/output models supported" << endl;
         return 1;
     }
+    
+    int32_t input_tensor_idx = inputs->Get(0);
+    int32_t output_tensor_idx = outputs->Get(0);
+    
+    const tflite::Tensor* input_tensor = (input_tensor_idx >= 0 && input_tensor_idx < static_cast<int>(tensors->size()))
+        ? tensors->Get(input_tensor_idx) : nullptr;
+    const tflite::Tensor* output_tensor = (output_tensor_idx >= 0 && output_tensor_idx < static_cast<int>(tensors->size()))
+        ? tensors->Get(output_tensor_idx) : nullptr;
+    
+    if (!input_tensor || !output_tensor) {
+        cerr << "Error: Cannot access input/output tensors" << endl;
+        return 1;
+    }
+    
+    size_t input_size = CalculateTensorSize(input_tensor->shape());
+    size_t output_size = CalculateTensorSize(output_tensor->shape());
     
     // Create output directory
     string output_dir = base_name;
@@ -1305,47 +1235,52 @@ int main(int argc, char* argv[]) {
     }
     cout << "Created directory: " << output_dir << endl;
     
-    // Get input/output info for header generation
-    const auto& input_indices = interpreter->inputs();
-    const auto& output_indices = interpreter->outputs();
-    const TfLiteTensor* input_tensor = interpreter->tensor(input_indices[0]);
-    const TfLiteTensor* output_tensor = interpreter->tensor(output_indices[0]);
-    size_t input_size = CalculateTensorSize(input_tensor->dims);
-    size_t output_size = CalculateTensorSize(output_tensor->dims);
-    
     // Generate files
-    // First create weight mapping (used by both weight and model generation)
-    map<int, string> tensor_to_weight = CreateWeightMapping(*interpreter);
+    // First create weight mapping
+    map<int, string> tensor_to_weight = CreateWeightMapping(model, subgraph);
     
     // Collect intermediate buffers info
     map<int, size_t> tensor_sizes;
-    tensor_sizes[input_indices[0]] = input_size;
-    tensor_sizes[output_indices[0]] = output_size;
-    const auto& execution_plan = interpreter->execution_plan();
-    for (size_t i = 0; i < execution_plan.size(); ++i) {
-        const int node_index = execution_plan[i];
-        const auto* node_and_reg = interpreter->node_and_registration(node_index);
-        if (!node_and_reg) continue;
-        const auto& node = node_and_reg->first;
-        if (node.inputs && node.inputs->size > 0) {
-            for (int j = 0; j < node.inputs->size; ++j) {
-                int tensor_idx = node.inputs->data[j];
-                const TfLiteTensor* tensor = interpreter->tensor(tensor_idx);
-                if (tensor && tensor_sizes.find(tensor_idx) == tensor_sizes.end()) {
-                    tensor_sizes[tensor_idx] = CalculateTensorSize(tensor->dims);
+    tensor_sizes[input_tensor_idx] = input_size;
+    tensor_sizes[output_tensor_idx] = output_size;
+    
+    // Process operators to find all tensor sizes
+    if (operators) {
+        for (size_t i = 0; i < operators->size(); ++i) {
+            const tflite::Operator* op = operators->Get(i);
+            if (!op) continue;
+            
+            const auto* op_inputs = op->inputs();
+            const auto* op_outputs = op->outputs();
+            
+            if (op_inputs) {
+                for (size_t j = 0; j < op_inputs->size(); ++j) {
+                    int tensor_idx = op_inputs->Get(j);
+                    if (tensor_idx >= 0 && tensor_idx < static_cast<int>(tensors->size()) &&
+                        tensor_sizes.find(tensor_idx) == tensor_sizes.end()) {
+                        const tflite::Tensor* tensor = tensors->Get(tensor_idx);
+                        if (tensor) {
+                            tensor_sizes[tensor_idx] = CalculateTensorSize(tensor->shape());
+                        }
+                    }
                 }
             }
-        }
-        if (node.outputs && node.outputs->size > 0) {
-            for (int j = 0; j < node.outputs->size; ++j) {
-                int tensor_idx = node.outputs->data[j];
-                const TfLiteTensor* tensor = interpreter->tensor(tensor_idx);
-                if (tensor && tensor_sizes.find(tensor_idx) == tensor_sizes.end()) {
-                    tensor_sizes[tensor_idx] = CalculateTensorSize(tensor->dims);
+            
+            if (op_outputs) {
+                for (size_t j = 0; j < op_outputs->size(); ++j) {
+                    int tensor_idx = op_outputs->Get(j);
+                    if (tensor_idx >= 0 && tensor_idx < static_cast<int>(tensors->size()) &&
+                        tensor_sizes.find(tensor_idx) == tensor_sizes.end()) {
+                        const tflite::Tensor* tensor = tensors->Get(tensor_idx);
+                        if (tensor) {
+                            tensor_sizes[tensor_idx] = CalculateTensorSize(tensor->shape());
+                        }
+                    }
                 }
             }
         }
     }
+    
     vector<pair<int, size_t>> intermediate_buffers;
     // Get set of weight tensor indices to exclude them
     set<int> weight_tensor_indices;
@@ -1353,25 +1288,31 @@ int main(int argc, char* argv[]) {
         weight_tensor_indices.insert(tensor_idx);
     }
     
-    // Collect all output tensors from operations to ensure we don't miss any
+    // Collect all output tensors from operations
     set<int> operation_output_tensors;
-    for (size_t i = 0; i < execution_plan.size(); ++i) {
-        const int node_index = execution_plan[i];
-        const auto* node_and_reg = interpreter->node_and_registration(node_index);
-        if (!node_and_reg) continue;
-        const auto& node = node_and_reg->first;
-        if (node.outputs && node.outputs->size > 0) {
-            for (int j = 0; j < node.outputs->size; ++j) {
-                int tensor_idx = node.outputs->data[j];
-                operation_output_tensors.insert(tensor_idx);
-                // Ensure it's in tensor_sizes with correct size
-                if (tensor_sizes.find(tensor_idx) == tensor_sizes.end()) {
-                    const TfLiteTensor* tensor = interpreter->tensor(tensor_idx);
-                    if (tensor) {
-                        size_t size = CalculateTensorSize(tensor->dims);
-                        tensor_sizes[tensor_idx] = size > 0 ? size : 1;  // Ensure at least size 1
-                    } else {
-                        tensor_sizes[tensor_idx] = 1;  // Default size if tensor not accessible
+    if (operators) {
+        for (size_t i = 0; i < operators->size(); ++i) {
+            const tflite::Operator* op = operators->Get(i);
+            if (!op) continue;
+            
+            const auto* op_outputs = op->outputs();
+            if (op_outputs) {
+                for (size_t j = 0; j < op_outputs->size(); ++j) {
+                    int tensor_idx = op_outputs->Get(j);
+                    operation_output_tensors.insert(tensor_idx);
+                    // Ensure it's in tensor_sizes
+                    if (tensor_sizes.find(tensor_idx) == tensor_sizes.end()) {
+                        if (tensor_idx >= 0 && tensor_idx < static_cast<int>(tensors->size())) {
+                            const tflite::Tensor* tensor = tensors->Get(tensor_idx);
+                            if (tensor) {
+                                size_t size = CalculateTensorSize(tensor->shape());
+                                tensor_sizes[tensor_idx] = size > 0 ? size : 1;
+                            } else {
+                                tensor_sizes[tensor_idx] = 1;
+                            }
+                        } else {
+                            tensor_sizes[tensor_idx] = 1;
+                        }
                     }
                 }
             }
@@ -1380,7 +1321,7 @@ int main(int argc, char* argv[]) {
     
     // Now collect all intermediate buffers
     for (const auto& tensor_idx : operation_output_tensors) {
-        if (tensor_idx != input_indices[0] && tensor_idx != output_indices[0]) {
+        if (tensor_idx != input_tensor_idx && tensor_idx != output_tensor_idx) {
             // Skip if it's a weight tensor
             if (weight_tensor_indices.find(tensor_idx) == weight_tensor_indices.end()) {
                 size_t size = tensor_sizes.count(tensor_idx) ? tensor_sizes[tensor_idx] : 1;
@@ -1391,7 +1332,7 @@ int main(int argc, char* argv[]) {
     
     // Also include any other tensors from tensor_sizes that might have been missed
     for (const auto& [tensor_idx, size] : tensor_sizes) {
-        if (tensor_idx != input_indices[0] && tensor_idx != output_indices[0]) {
+        if (tensor_idx != input_tensor_idx && tensor_idx != output_tensor_idx) {
             // Skip if already added or if it's a weight
             bool already_added = false;
             for (const auto& [buf_idx, buf_size] : intermediate_buffers) {
@@ -1413,10 +1354,11 @@ int main(int argc, char* argv[]) {
     string makefile = output_dir + "/Makefile";
     
     cout << "\nGenerating code files..." << endl;
-    GenerateWeightsFile(weights_file, base_name, *interpreter, tensor_to_weight);
+    GenerateWeightsFile(weights_file, base_name, model, subgraph, tensor_to_weight);
     GenerateModelHeader(model_header_file, base_name, input_size, output_size, intermediate_buffers);
-    GenerateModelFile(model_file, base_name, *interpreter, tensor_to_weight, intermediate_buffers);
-    GenerateInferenceFile(inference_file, base_name, *interpreter);
+    GenerateModelFile(model_file, base_name, model, subgraph, tensor_to_weight, intermediate_buffers, 
+                     tensor_sizes, input_tensor_idx, output_tensor_idx);
+    GenerateInferenceFile(inference_file, base_name, subgraph, input_tensor_idx, output_tensor_idx);
     GenerateMakefile(makefile, base_name);
     
     cout << "\nCode generation complete!" << endl;
@@ -1429,7 +1371,7 @@ int main(int argc, char* argv[]) {
     cout << "\nTo build the inference executable:" << endl;
     cout << "  cd " << output_dir << " && make" << endl;
     cout << "\nNote: The generated code can be compiled independently without TFLite dependencies." << endl;
+    cout << "This code generator uses direct FlatBuffer inspection, requiring only the schema header." << endl;
     
     return 0;
 }
-
