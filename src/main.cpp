@@ -1,5 +1,6 @@
 // src/main.cpp
 // TFLite Model Inspector - Reads and displays structure of a .tflite model
+// Direct FlatBuffer inspection without requiring operator implementations
 
 #include <iostream>
 #include <fstream>
@@ -10,99 +11,110 @@
 #include <algorithm>
 #include <cstring>
 
-// TensorFlow Lite headers
-#include "tensorflow/lite/model_builder.h"
-#include "tensorflow/lite/interpreter.h"
-#include "tensorflow/lite/kernels/register.h"
+// TensorFlow Lite FlatBuffer schema header
 #include "tensorflow/lite/schema/schema_generated.h"
-#include "tensorflow/lite/kernels/builtin_op_kernels.h"
 
 using namespace std;
+
+// TFLite schema version constant (typically 3)
+// This is defined in tensorflow/lite/version.h but we define it here
+// to avoid dependency on the full TFLite library
+#ifndef TFLITE_SCHEMA_VERSION
+#define TFLITE_SCHEMA_VERSION (3)
+#endif
 
 namespace {
 
 constexpr int kDisplayWeightsCount = 10;  // Number of weights to show at head/tail
 
-// Helper function to get tensor type name
-string GetTensorTypeName(TfLiteType type) {
+// Helper function to get tensor type name from FlatBuffer enum
+string GetTensorTypeName(tflite::TensorType type) {
     switch (type) {
-        case kTfLiteFloat32: return "FLOAT32";
-        case kTfLiteInt32: return "INT32";
-        case kTfLiteUInt8: return "UINT8";
-        case kTfLiteInt64: return "INT64";
-        case kTfLiteString: return "STRING";
-        case kTfLiteBool: return "BOOL";
-        case kTfLiteInt16: return "INT16";
-        case kTfLiteComplex64: return "COMPLEX64";
-        case kTfLiteInt8: return "INT8";
-        case kTfLiteFloat16: return "FLOAT16";
-        case kTfLiteFloat64: return "FLOAT64";
-        case kTfLiteComplex128: return "COMPLEX128";
-        case kTfLiteUInt64: return "UINT64";
-        case kTfLiteResource: return "RESOURCE";
-        case kTfLiteVariant: return "VARIANT";
-        case kTfLiteUInt32: return "UINT32";
-        case kTfLiteUInt16: return "UINT16";
+        case tflite::TensorType_FLOAT32: return "FLOAT32";
+        case tflite::TensorType_INT32: return "INT32";
+        case tflite::TensorType_UINT8: return "UINT8";
+        case tflite::TensorType_INT64: return "INT64";
+        case tflite::TensorType_STRING: return "STRING";
+        case tflite::TensorType_BOOL: return "BOOL";
+        case tflite::TensorType_INT16: return "INT16";
+        case tflite::TensorType_COMPLEX64: return "COMPLEX64";
+        case tflite::TensorType_INT8: return "INT8";
+        case tflite::TensorType_FLOAT16: return "FLOAT16";
+        case tflite::TensorType_FLOAT64: return "FLOAT64";
+        case tflite::TensorType_COMPLEX128: return "COMPLEX128";
+        case tflite::TensorType_UINT64: return "UINT64";
+        case tflite::TensorType_RESOURCE: return "RESOURCE";
+        case tflite::TensorType_VARIANT: return "VARIANT";
+        case tflite::TensorType_UINT32: return "UINT32";
+        case tflite::TensorType_UINT16: return "UINT16";
         default: return "UNKNOWN";
     }
 }
 
-// Helper function to get allocation type name
-string GetAllocationTypeName(TfLiteAllocationType type) {
-    switch (type) {
-        case kTfLiteMemNone: return "NONE";
-        case kTfLiteMmapRo: return "MMAP_RO";
-        case kTfLiteDynamic: return "DYNAMIC";
-        case kTfLiteArenaRw: return "ARENA_RW";
-        case kTfLiteArenaRwPersistent: return "ARENA_RW_PERSISTENT";
-        case kTfLitePersistentRo: return "PERSISTENT_RO";
-        case kTfLiteCustom: return "CUSTOM";
-        default: return "UNKNOWN";
-    }
-}
-
-// Helper function to get operator name
-string GetOperatorName(const tflite::Interpreter& interpreter, int node_index) {
-    const auto* node_and_reg = interpreter.node_and_registration(node_index);
-    if (!node_and_reg) {
+// Helper function to get operator name from FlatBuffer
+string GetOperatorName(const tflite::OperatorCode* op_code) {
+    if (!op_code) {
         return "UNKNOWN";
     }
     
-    const auto& registration = node_and_reg->second;
-    if (registration.builtin_code != tflite::BuiltinOperator_CUSTOM) {
-        return tflite::EnumNameBuiltinOperator(
-            static_cast<tflite::BuiltinOperator>(registration.builtin_code));
+    if (op_code->builtin_code() != tflite::BuiltinOperator_CUSTOM) {
+        const char* name = tflite::EnumNameBuiltinOperator(
+            static_cast<tflite::BuiltinOperator>(op_code->builtin_code()));
+        return name ? name : "UNKNOWN";
     } else {
-        return string("CUSTOM:") + (registration.custom_name ? registration.custom_name : "");
+        string result = "CUSTOM:";
+        if (op_code->custom_code()) {
+            result += op_code->custom_code()->c_str();
+        }
+        return result;
     }
 }
 
-// Print tensor shape
-void PrintTensorShape(const TfLiteIntArray* dims) {
-    if (!dims || dims->size == 0) {
+// Print tensor shape from FlatBuffer
+void PrintTensorShape(const flatbuffers::Vector<int32_t>* shape) {
+    if (!shape || shape->size() == 0) {
         cout << "scalar";
         return;
     }
     
-    for (int i = 0; i < dims->size; ++i) {
-        cout << dims->data[i];
-        if (i < dims->size - 1) {
+    for (size_t i = 0; i < shape->size(); ++i) {
+        cout << shape->Get(i);
+        if (i < shape->size() - 1) {
             cout << "x";
         }
     }
 }
 
 // Calculate total number of elements in a tensor
-size_t CalculateTensorSize(const TfLiteIntArray* dims) {
-    if (!dims || dims->size == 0) {
+size_t CalculateTensorSize(const flatbuffers::Vector<int32_t>* shape) {
+    if (!shape || shape->size() == 0) {
         return 1;
     }
     
     size_t size = 1;
-    for (int i = 0; i < dims->size; ++i) {
-        size *= static_cast<size_t>(dims->data[i]);
+    for (size_t i = 0; i < shape->size(); ++i) {
+        size *= static_cast<size_t>(shape->Get(i));
     }
     return size;
+}
+
+// Calculate bytes per element based on tensor type
+size_t GetBytesPerElement(tflite::TensorType type) {
+    switch (type) {
+        case tflite::TensorType_FLOAT32: return 4;
+        case tflite::TensorType_INT32: return 4;
+        case tflite::TensorType_UINT8: return 1;
+        case tflite::TensorType_INT64: return 8;
+        case tflite::TensorType_INT16: return 2;
+        case tflite::TensorType_INT8: return 1;
+        case tflite::TensorType_FLOAT16: return 2;
+        case tflite::TensorType_FLOAT64: return 8;
+        case tflite::TensorType_UINT64: return 8;
+        case tflite::TensorType_UINT32: return 4;
+        case tflite::TensorType_UINT16: return 2;
+        case tflite::TensorType_BOOL: return 1;
+        default: return 0;
+    }
 }
 
 // Print weights array (head and tail)
@@ -142,210 +154,310 @@ void PrintWeightsArray(const T* data, size_t num_elements, const string& tensor_
     }
 }
 
-// Print model structure
-void PrintModelStructure(tflite::Interpreter& interpreter) {
+// Print model structure from FlatBuffer
+void PrintModelStructure(const tflite::Model* model) {
+    if (!model) {
+        cerr << "Error: Model is null" << endl;
+        return;
+    }
+    
     cout << "\n=== Model Structure ===" << endl;
+    cout << "Model Version: " << model->version() << endl;
+    
+    const auto* subgraphs = model->subgraphs();
+    if (!subgraphs || subgraphs->size() == 0) {
+        cerr << "Error: No subgraphs found in model" << endl;
+        return;
+    }
+    
+    // Process the main subgraph (usually index 0)
+    const tflite::SubGraph* subgraph = subgraphs->Get(0);
+    if (!subgraph) {
+        cerr << "Error: Subgraph is null" << endl;
+        return;
+    }
+    
+    const auto* tensors = subgraph->tensors();
+    const auto* inputs = subgraph->inputs();
+    const auto* outputs = subgraph->outputs();
+    const auto* operators = subgraph->operators();
+    const auto* operator_codes = model->operator_codes();
     
     // Print input tensors
-    const auto& input_indices = interpreter.inputs();
-    cout << "\nInput Tensors (" << input_indices.size() << " total):" << endl;
-    cout << string(80, '-') << endl;
-    
-    for (size_t i = 0; i < input_indices.size(); ++i) {
-        const int tensor_index = input_indices[i];
-        const TfLiteTensor* tensor = interpreter.tensor(tensor_index);
-        if (!tensor) {
-            continue;
-        }
+    if (inputs && tensors) {
+        cout << "\nInput Tensors (" << inputs->size() << " total):" << endl;
+        cout << string(80, '-') << endl;
         
-        cout << "\nInput " << i << " (Tensor " << tensor_index << "):" << endl;
-        cout << "  Name: " << (tensor->name ? tensor->name : "(unnamed)") << endl;
-        cout << "  Type: " << GetTensorTypeName(tensor->type) << endl;
-        cout << "  Shape: [";
-        PrintTensorShape(tensor->dims);
-        cout << "]" << endl;
-        cout << "  Allocation: " << GetAllocationTypeName(tensor->allocation_type) << endl;
-        cout << "  Bytes: " << tensor->bytes << endl;
+        for (size_t i = 0; i < inputs->size(); ++i) {
+            int32_t tensor_index = inputs->Get(i);
+            if (tensor_index < 0 || tensor_index >= static_cast<int32_t>(tensors->size())) {
+                continue;
+            }
+            
+            const tflite::Tensor* tensor = tensors->Get(tensor_index);
+            if (!tensor) {
+                continue;
+            }
+            
+            cout << "\nInput " << i << " (Tensor " << tensor_index << "):" << endl;
+            cout << "  Name: " << (tensor->name() ? tensor->name()->c_str() : "(unnamed)") << endl;
+            cout << "  Type: " << GetTensorTypeName(tensor->type()) << endl;
+            cout << "  Shape: [";
+            PrintTensorShape(tensor->shape());
+            cout << "]" << endl;
+            
+            size_t num_elements = CalculateTensorSize(tensor->shape());
+            size_t bytes_per_element = GetBytesPerElement(tensor->type());
+            size_t total_bytes = num_elements * bytes_per_element;
+            cout << "  Bytes: " << total_bytes << endl;
+        }
     }
     
     // Print output tensors
-    const auto& output_indices = interpreter.outputs();
-    cout << "\n\nOutput Tensors (" << output_indices.size() << " total):" << endl;
-    cout << string(80, '-') << endl;
-    
-    for (size_t i = 0; i < output_indices.size(); ++i) {
-        const int tensor_index = output_indices[i];
-        const TfLiteTensor* tensor = interpreter.tensor(tensor_index);
-        if (!tensor) {
-            continue;
-        }
+    if (outputs && tensors) {
+        cout << "\n\nOutput Tensors (" << outputs->size() << " total):" << endl;
+        cout << string(80, '-') << endl;
         
-        cout << "\nOutput " << i << " (Tensor " << tensor_index << "):" << endl;
-        cout << "  Name: " << (tensor->name ? tensor->name : "(unnamed)") << endl;
-        cout << "  Type: " << GetTensorTypeName(tensor->type) << endl;
-        cout << "  Shape: [";
-        PrintTensorShape(tensor->dims);
-        cout << "]" << endl;
-        cout << "  Allocation: " << GetAllocationTypeName(tensor->allocation_type) << endl;
-        cout << "  Bytes: " << tensor->bytes << endl;
+        for (size_t i = 0; i < outputs->size(); ++i) {
+            int32_t tensor_index = outputs->Get(i);
+            if (tensor_index < 0 || tensor_index >= static_cast<int32_t>(tensors->size())) {
+                continue;
+            }
+            
+            const tflite::Tensor* tensor = tensors->Get(tensor_index);
+            if (!tensor) {
+                continue;
+            }
+            
+            cout << "\nOutput " << i << " (Tensor " << tensor_index << "):" << endl;
+            cout << "  Name: " << (tensor->name() ? tensor->name()->c_str() : "(unnamed)") << endl;
+            cout << "  Type: " << GetTensorTypeName(tensor->type()) << endl;
+            cout << "  Shape: [";
+            PrintTensorShape(tensor->shape());
+            cout << "]" << endl;
+            
+            size_t num_elements = CalculateTensorSize(tensor->shape());
+            size_t bytes_per_element = GetBytesPerElement(tensor->type());
+            size_t total_bytes = num_elements * bytes_per_element;
+            cout << "  Bytes: " << total_bytes << endl;
+        }
     }
     
     // Print all tensors
-    const size_t num_tensors = interpreter.tensors_size();
-    cout << "\n\nAll Tensors (" << num_tensors << " total):" << endl;
-    cout << string(80, '-') << endl;
-    
-    for (size_t i = 0; i < num_tensors; ++i) {
-        const TfLiteTensor* tensor = interpreter.tensor(i);
-        if (!tensor) {
-            continue;
-        }
+    if (tensors) {
+        cout << "\n\nAll Tensors (" << tensors->size() << " total):" << endl;
+        cout << string(80, '-') << endl;
         
-        cout << "\nTensor " << i << ":" << endl;
-        cout << "  Name: " << (tensor->name ? tensor->name : "(unnamed)") << endl;
-        cout << "  Type: " << GetTensorTypeName(tensor->type) << endl;
-        cout << "  Shape: [";
-        PrintTensorShape(tensor->dims);
-        cout << "]" << endl;
-        cout << "  Allocation: " << GetAllocationTypeName(tensor->allocation_type) << endl;
-        cout << "  Bytes: " << tensor->bytes << endl;
+        for (size_t i = 0; i < tensors->size(); ++i) {
+            const tflite::Tensor* tensor = tensors->Get(i);
+            if (!tensor) {
+                continue;
+            }
+            
+            cout << "\nTensor " << i << ":" << endl;
+            cout << "  Name: " << (tensor->name() ? tensor->name()->c_str() : "(unnamed)") << endl;
+            cout << "  Type: " << GetTensorTypeName(tensor->type()) << endl;
+            cout << "  Shape: [";
+            PrintTensorShape(tensor->shape());
+            cout << "]" << endl;
+            
+            size_t num_elements = CalculateTensorSize(tensor->shape());
+            size_t bytes_per_element = GetBytesPerElement(tensor->type());
+            size_t total_bytes = num_elements * bytes_per_element;
+            cout << "  Bytes: " << total_bytes << endl;
+            cout << "  Buffer Index: " << tensor->buffer() << endl;
+        }
     }
     
     // Print operators/layers
-    const auto& execution_plan = interpreter.execution_plan();
-    cout << "\n\nOperators/Layers (" << execution_plan.size() << " total):" << endl;
-    cout << string(80, '-') << endl;
-    
-    for (size_t i = 0; i < execution_plan.size(); ++i) {
-        const int node_index = execution_plan[i];
-        const auto* node_and_reg = interpreter.node_and_registration(node_index);
+    if (operators && operator_codes) {
+        cout << "\n\nOperators/Layers (" << operators->size() << " total):" << endl;
+        cout << string(80, '-') << endl;
         
-        if (!node_and_reg) {
-            continue;
-        }
-        
-        const auto& node = node_and_reg->first;
-        const auto& registration = node_and_reg->second;
-        
-        cout << "\nLayer " << i << " (Node " << node_index << "):" << endl;
-        cout << "  Operator: " << GetOperatorName(interpreter, node_index) << endl;
-        cout << "  Builtin Code: " << registration.builtin_code << endl;
-        cout << "  Version: " << registration.version << endl;
-        
-        // Input tensors
-        if (node.inputs && node.inputs->size > 0) {
-            cout << "  Inputs (" << node.inputs->size << "): ";
-            for (int j = 0; j < node.inputs->size; ++j) {
-                cout << node.inputs->data[j];
-                if (j < node.inputs->size - 1) {
-                    cout << ", ";
-                }
+        for (size_t i = 0; i < operators->size(); ++i) {
+            const tflite::Operator* op = operators->Get(i);
+            if (!op) {
+                continue;
             }
-            cout << endl;
-        }
-        
-        // Output tensors
-        if (node.outputs && node.outputs->size > 0) {
-            cout << "  Outputs (" << node.outputs->size << "): ";
-            for (int j = 0; j < node.outputs->size; ++j) {
-                cout << node.outputs->data[j];
-                if (j < node.outputs->size - 1) {
-                    cout << ", ";
-                }
+            
+            int32_t op_code_index = op->opcode_index();
+            if (op_code_index < 0 || op_code_index >= static_cast<int32_t>(operator_codes->size())) {
+                continue;
             }
-            cout << endl;
+            
+            const tflite::OperatorCode* op_code = operator_codes->Get(op_code_index);
+            
+            cout << "\nLayer " << i << ":" << endl;
+            cout << "  Operator: " << GetOperatorName(op_code) << endl;
+            if (op_code) {
+                cout << "  Builtin Code: " << op_code->builtin_code() << endl;
+                cout << "  Version: " << op_code->version() << endl;
+            }
+            
+            // Input tensors
+            const auto* op_inputs = op->inputs();
+            if (op_inputs && op_inputs->size() > 0) {
+                cout << "  Inputs (" << op_inputs->size() << "): ";
+                for (size_t j = 0; j < op_inputs->size(); ++j) {
+                    cout << op_inputs->Get(j);
+                    if (j < op_inputs->size() - 1) {
+                        cout << ", ";
+                    }
+                }
+                cout << endl;
+            }
+            
+            // Output tensors
+            const auto* op_outputs = op->outputs();
+            if (op_outputs && op_outputs->size() > 0) {
+                cout << "  Outputs (" << op_outputs->size() << "): ";
+                for (size_t j = 0; j < op_outputs->size(); ++j) {
+                    cout << op_outputs->Get(j);
+                    if (j < op_outputs->size() - 1) {
+                        cout << ", ";
+                    }
+                }
+                cout << endl;
+            }
         }
     }
 }
 
-// Print weights information
-void PrintWeights(tflite::Interpreter& interpreter) {
+// Print weights information from FlatBuffer
+void PrintWeights(const tflite::Model* model) {
+    if (!model) {
+        return;
+    }
+    
     cout << "\n\n=== Model Weights ===" << endl;
     
-    const size_t num_tensors = interpreter.tensors_size();
+    const auto* subgraphs = model->subgraphs();
+    const auto* buffers = model->buffers();
+    
+    if (!subgraphs || subgraphs->size() == 0 || !buffers) {
+        cout << "\nNo weight tensors found." << endl;
+        return;
+    }
+    
+    const tflite::SubGraph* subgraph = subgraphs->Get(0);
+    if (!subgraph) {
+        return;
+    }
+    
+    const auto* tensors = subgraph->tensors();
+    if (!tensors) {
+        return;
+    }
+    
     bool found_weights = false;
     
-    for (size_t i = 0; i < num_tensors; ++i) {
-        const TfLiteTensor* tensor = interpreter.tensor(i);
+    for (size_t i = 0; i < tensors->size(); ++i) {
+        const tflite::Tensor* tensor = tensors->Get(i);
         if (!tensor) {
             continue;
         }
         
-        // Weights are typically read-only tensors (MMAP_RO or PERSISTENT_RO)
-        if (tensor->allocation_type == kTfLiteMmapRo || 
-            tensor->allocation_type == kTfLitePersistentRo) {
-            
-            found_weights = true;
-            const size_t num_elements = CalculateTensorSize(tensor->dims);
-            
-            cout << "\nTensor " << i << ": " 
-                      << (tensor->name ? tensor->name : "(unnamed)") << endl;
-            cout << "  Type: " << GetTensorTypeName(tensor->type) << endl;
-            cout << "  Shape: [";
-            PrintTensorShape(tensor->dims);
-            cout << "]" << endl;
-            cout << "  Elements: " << num_elements << endl;
-            cout << "  Size: " << tensor->bytes << " bytes" << endl;
-            
-            // Print weights based on type
-            switch (tensor->type) {
-                case kTfLiteFloat32: {
-                    const float* data = interpreter.typed_tensor<float>(i);
-                    if (data) {
-                        PrintWeightsArray(data, num_elements, tensor->name ? tensor->name : "");
-                    }
-                    break;
-                }
-                case kTfLiteInt32: {
-                    const int32_t* data = interpreter.typed_tensor<int32_t>(i);
-                    if (data) {
-                        PrintWeightsArray(data, num_elements, tensor->name ? tensor->name : "");
-                    }
-                    break;
-                }
-                case kTfLiteInt8: {
-                    const int8_t* data = interpreter.typed_tensor<int8_t>(i);
-                    if (data) {
-                        PrintWeightsArray(data, num_elements, tensor->name ? tensor->name : "");
-                    }
-                    break;
-                }
-                case kTfLiteUInt8: {
-                    const uint8_t* data = interpreter.typed_tensor<uint8_t>(i);
-                    if (data) {
-                        PrintWeightsArray(data, num_elements, tensor->name ? tensor->name : "");
-                    }
-                    break;
-                }
-                case kTfLiteFloat16: {
-                    // Note: Float16 may need special handling depending on platform
-                    cout << "  Float16 weights (raw bytes shown):" << endl;
-                    const void* data = tensor->data.data;
-                    if (data && num_elements > 0) {
-                        const uint16_t* data_u16 = static_cast<const uint16_t*>(data);
-                        const size_t display_count = min(
-                            static_cast<size_t>(kDisplayWeightsCount), num_elements);
-                        cout << "  Head: ";
-                        for (size_t j = 0; j < display_count; ++j) {
-                            cout << "0x" << hex << data_u16[j] << dec;
-                            if (j < display_count - 1) {
-                                cout << ", ";
-                            }
-                        }
-                        cout << endl;
-                    }
-                    break;
-                }
-                default:
-                    cout << "  Type " << GetTensorTypeName(tensor->type) 
-                              << " not yet supported for weight display" << endl;
-                    break;
+        // Weight tensors have a buffer index > 0 (0 is typically empty/unused)
+        uint32_t buffer_index = tensor->buffer();
+        if (buffer_index == 0 || buffer_index >= buffers->size()) {
+            continue;
+        }
+        
+        const tflite::Buffer* buffer = buffers->Get(buffer_index);
+        if (!buffer || !buffer->data()) {
+            continue;
+        }
+        
+        found_weights = true;
+        const size_t num_elements = CalculateTensorSize(tensor->shape());
+        size_t bytes_per_element = GetBytesPerElement(tensor->type());
+        size_t total_bytes = num_elements * bytes_per_element;
+        
+        cout << "\nTensor " << i << ": " 
+                  << (tensor->name() ? tensor->name()->c_str() : "(unnamed)") << endl;
+        cout << "  Type: " << GetTensorTypeName(tensor->type()) << endl;
+        cout << "  Shape: [";
+        PrintTensorShape(tensor->shape());
+        cout << "]" << endl;
+        cout << "  Elements: " << num_elements << endl;
+        cout << "  Size: " << total_bytes << " bytes" << endl;
+        cout << "  Buffer Index: " << buffer_index << endl;
+        
+        // Get buffer data
+        const flatbuffers::Vector<uint8_t>* data_vec = buffer->data();
+        if (!data_vec || data_vec->size() < total_bytes) {
+            cout << "  Warning: Buffer size mismatch" << endl;
+            continue;
+        }
+        
+        const uint8_t* raw_data = data_vec->data();
+        
+        // Print weights based on type
+        switch (tensor->type()) {
+            case tflite::TensorType_FLOAT32: {
+                const float* data = reinterpret_cast<const float*>(raw_data);
+                PrintWeightsArray(data, num_elements, 
+                    tensor->name() ? tensor->name()->c_str() : "");
+                break;
             }
+            case tflite::TensorType_INT32: {
+                const int32_t* data = reinterpret_cast<const int32_t*>(raw_data);
+                PrintWeightsArray(data, num_elements, 
+                    tensor->name() ? tensor->name()->c_str() : "");
+                break;
+            }
+            case tflite::TensorType_INT8: {
+                const int8_t* data = reinterpret_cast<const int8_t*>(raw_data);
+                PrintWeightsArray(data, num_elements, 
+                    tensor->name() ? tensor->name()->c_str() : "");
+                break;
+            }
+            case tflite::TensorType_UINT8: {
+                const uint8_t* data = raw_data;
+                PrintWeightsArray(data, num_elements, 
+                    tensor->name() ? tensor->name()->c_str() : "");
+                break;
+            }
+            case tflite::TensorType_FLOAT16: {
+                // Note: Float16 may need special handling depending on platform
+                cout << "  Float16 weights (raw bytes shown):" << endl;
+                const uint16_t* data_u16 = reinterpret_cast<const uint16_t*>(raw_data);
+                const size_t display_count = min(
+                    static_cast<size_t>(kDisplayWeightsCount), num_elements);
+                cout << "  Head: ";
+                for (size_t j = 0; j < display_count; ++j) {
+                    cout << "0x" << hex << data_u16[j] << dec;
+                    if (j < display_count - 1) {
+                        cout << ", ";
+                    }
+                }
+                cout << endl;
+                if (num_elements > display_count) {
+                    cout << "  Total elements: " << num_elements << endl;
+                }
+                break;
+            }
+            case tflite::TensorType_INT16: {
+                const int16_t* data = reinterpret_cast<const int16_t*>(raw_data);
+                PrintWeightsArray(data, num_elements, 
+                    tensor->name() ? tensor->name()->c_str() : "");
+                break;
+            }
+            case tflite::TensorType_UINT16: {
+                const uint16_t* data = reinterpret_cast<const uint16_t*>(raw_data);
+                PrintWeightsArray(data, num_elements, 
+                    tensor->name() ? tensor->name()->c_str() : "");
+                break;
+            }
+            default:
+                cout << "  Type " << GetTensorTypeName(tensor->type()) 
+                          << " not yet supported for weight display" << endl;
+                break;
         }
     }
     
     if (!found_weights) {
-        cout << "\nNo weight tensors found (read-only tensors)." << endl;
+        cout << "\nNo weight tensors found (tensors with buffer data)." << endl;
     }
 }
 
@@ -371,110 +483,56 @@ int main(int argc, char* argv[]) {
     
     cout << "Loading TFLite model from: " << model_path << endl;
     
-    // Load the model
-    unique_ptr<tflite::FlatBufferModel> model = 
-        tflite::FlatBufferModel::BuildFromFile(model_path.c_str());
-    
-    if (!model) {
-        cerr << "Error: Failed to load model from " << model_path << endl;
+    // Read the entire file into memory
+    ifstream file(model_path, ios::binary | ios::ate);
+    if (!file.is_open()) {
+        cerr << "Error: Failed to open file: " << model_path << endl;
         return 1;
+    }
+    
+    streamsize file_size = file.tellg();
+    file.seekg(0, ios::beg);
+    
+    vector<uint8_t> buffer(file_size);
+    if (!file.read(reinterpret_cast<char*>(buffer.data()), file_size)) {
+        cerr << "Error: Failed to read file: " << model_path << endl;
+        return 1;
+    }
+    file.close();
+    
+    cout << "File read successfully (" << file_size << " bytes)" << endl;
+    
+    // Verify FlatBuffer
+    flatbuffers::Verifier verifier(buffer.data(), buffer.size());
+    if (!tflite::VerifyModelBuffer(verifier)) {
+        cerr << "Error: Invalid FlatBuffer format" << endl;
+        return 1;
+    }
+    
+    // Get the model from the FlatBuffer
+    const tflite::Model* model = tflite::GetModel(buffer.data());
+    if (!model) {
+        cerr << "Error: Failed to parse model from FlatBuffer" << endl;
+        return 1;
+    }
+    
+    // Verify model version
+    if (model->version() != TFLITE_SCHEMA_VERSION) {
+        cerr << "Warning: Model schema version " << model->version() 
+             << " doesn't match supported version " << TFLITE_SCHEMA_VERSION << endl;
     }
     
     cout << "Model loaded successfully!" << endl;
-    
-    // Build the interpreter
-    // tflite::ops::builtin::BuiltinOpResolver resolver;
-	tflite::MutableOpResolver resolver;
-
-	// Fully connected layers
-	resolver.AddBuiltin(tflite::BuiltinOperator_FULLY_CONNECTED,
-		tflite::ops::builtin::Register_FULLY_CONNECTED());
-	resolver.AddBuiltin(tflite::BuiltinOperator_SOFTMAX,
-		tflite::ops::builtin::Register_SOFTMAX());
-
-	// Activation functions
-	// Only add RELU if your model has a separate RELU op.
-	// (Many converters fuse relu into FULLY_CONNECTED.)
-	resolver.AddBuiltin(tflite::BuiltinOperator_RELU,
-		tflite::ops::builtin::Register_RELU());
-
-	// CNN operations
-	resolver.AddBuiltin(tflite::BuiltinOperator_CONV_2D,
-		tflite::ops::builtin::Register_CONV_2D());
-	resolver.AddBuiltin(tflite::BuiltinOperator_DEPTHWISE_CONV_2D,
-		tflite::ops::builtin::Register_DEPTHWISE_CONV_2D());
-	resolver.AddBuiltin(tflite::BuiltinOperator_MAX_POOL_2D,
-		tflite::ops::builtin::Register_MAX_POOL_2D());
-	resolver.AddBuiltin(tflite::BuiltinOperator_AVERAGE_POOL_2D,
-		tflite::ops::builtin::Register_AVERAGE_POOL_2D());
-
-	// Common operations used in CNNs
-	resolver.AddBuiltin(tflite::BuiltinOperator_RESHAPE,
-		tflite::ops::builtin::Register_RESHAPE());
-	resolver.AddBuiltin(tflite::BuiltinOperator_CONCATENATION,
-		tflite::ops::builtin::Register_CONCATENATION());
-	resolver.AddBuiltin(tflite::BuiltinOperator_PAD,
-		tflite::ops::builtin::Register_PAD());
-	resolver.AddBuiltin(tflite::BuiltinOperator_SHAPE,
-		tflite::ops::builtin::Register_SHAPE());
-	resolver.AddBuiltin(tflite::BuiltinOperator_STRIDED_SLICE,
-		tflite::ops::builtin::Register_STRIDED_SLICE());
-    resolver.AddBuiltin(tflite::BuiltinOperator_PACK,
-        tflite::ops::builtin::Register_PACK());
-    resolver.AddBuiltin(tflite::BuiltinOperator_SPLIT_V,
-        tflite::ops::builtin::Register_SPLIT_V());
-    resolver.AddBuiltin(tflite::BuiltinOperator_NEG,
-        tflite::ops::builtin::Register_NEG());
-    resolver.AddBuiltin(tflite::BuiltinOperator_FLOOR_DIV,
-        tflite::ops::builtin::Register_FLOOR_DIV());
-    resolver.AddBuiltin(tflite::BuiltinOperator_RANGE,
-        tflite::ops::builtin::Register_RANGE());
-    resolver.AddBuiltin(tflite::BuiltinOperator_SUB,
-        tflite::ops::builtin::Register_SUB());
-    resolver.AddBuiltin(tflite::BuiltinOperator_ADD,
-        tflite::ops::builtin::Register_ADD());
-    resolver.AddBuiltin(tflite::BuiltinOperator_MUL,
-        tflite::ops::builtin::Register_MUL());
-    resolver.AddBuiltin(tflite::BuiltinOperator_MAXIMUM,
-        tflite::ops::builtin::Register_MAXIMUM());
-    resolver.AddBuiltin(tflite::BuiltinOperator_PADV2,
-        tflite::ops::builtin::Register_PADV2());
-    resolver.AddBuiltin(tflite::BuiltinOperator_GATHER,
-        tflite::ops::builtin::Register_GATHER());
-    resolver.AddBuiltin(tflite::BuiltinOperator_EXPAND_DIMS,
-        tflite::ops::builtin::Register_EXPAND_DIMS());
-    // Note: RFFT2D is not available in all TFLite builds
-    // Uncomment the following line if your TFLite build includes RFFT2D support:
-    // resolver.AddBuiltin(tflite::BuiltinOperator_RFFT2D,
-    //     tflite::ops::builtin::Register_RFFT2D());
-
-    unique_ptr<tflite::Interpreter> interpreter;
-    
-    tflite::InterpreterBuilder builder(*model, resolver);
-    if (builder(&interpreter) != kTfLiteOk) {
-        cerr << "Error: Failed to construct interpreter." << endl;
-        return 1;
-    }
-    
-    if (!interpreter) {
-        cerr << "Error: Interpreter is null." << endl;
-        return 1;
-    }
-    
-    // Allocate tensors
-    if (interpreter->AllocateTensors() != kTfLiteOk) {
-        cerr << "Error: Failed to allocate tensors." << endl;
-        return 1;
-    }
-    
-    cout << "Interpreter initialized successfully!" << endl;
+    cout << "Model schema version: " << model->version() << endl;
     
     // Print model information
-    PrintModelStructure(*interpreter);
-    PrintWeights(*interpreter);
+    PrintModelStructure(model);
+    PrintWeights(model);
     
     cout << "\n\n=== Summary ===" << endl;
     cout << "Model inspection complete." << endl;
+    cout << "This inspection was performed using direct FlatBuffer parsing," << endl;
+    cout << "without requiring any operator implementations." << endl;
     
     return 0;
 }
