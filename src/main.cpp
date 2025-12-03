@@ -51,15 +51,30 @@ string GetTensorTypeName(tflite::TensorType type) {
     }
 }
 
+// Helper function to get the actual builtin code (handles schema v3 compatibility)
+// For v3 models, builtin_code defaults to 0, so we need to check deprecated_builtin_code
+// For newer models, builtin_code contains the actual value
+tflite::BuiltinOperator GetActualBuiltinCode(const tflite::OperatorCode* op_code) {
+    if (!op_code) {
+        return tflite::BuiltinOperator_CUSTOM;
+    }
+    // Use max of both fields to handle schema version compatibility
+    // v3 models use deprecated_builtin_code, newer models use builtin_code
+    return static_cast<tflite::BuiltinOperator>(
+        std::max(static_cast<int>(op_code->builtin_code()),
+                 static_cast<int>(op_code->deprecated_builtin_code())));
+}
+
 // Helper function to get operator name from FlatBuffer
 string GetOperatorName(const tflite::OperatorCode* op_code) {
     if (!op_code) {
         return "UNKNOWN";
     }
     
-    if (op_code->builtin_code() != tflite::BuiltinOperator_CUSTOM) {
-        const char* name = tflite::EnumNameBuiltinOperator(
-            static_cast<tflite::BuiltinOperator>(op_code->builtin_code()));
+    tflite::BuiltinOperator builtin_code = GetActualBuiltinCode(op_code);
+    
+    if (builtin_code != tflite::BuiltinOperator_CUSTOM) {
+        const char* name = tflite::EnumNameBuiltinOperator(builtin_code);
         return name ? name : "UNKNOWN";
     } else {
         string result = "CUSTOM:";
@@ -290,7 +305,10 @@ void PrintModelStructure(const tflite::Model* model) {
             cout << "\nLayer " << i << ":" << endl;
             cout << "  Operator: " << GetOperatorName(op_code) << endl;
             if (op_code) {
-                cout << "  Builtin Code: " << op_code->builtin_code() << endl;
+                tflite::BuiltinOperator actual_code = GetActualBuiltinCode(op_code);
+                cout << "  Builtin Code: " << static_cast<int>(actual_code) 
+                     << " (builtin_code=" << op_code->builtin_code() 
+                     << ", deprecated_builtin_code=" << op_code->deprecated_builtin_code() << ")" << endl;
                 cout << "  Version: " << op_code->version() << endl;
             }
             

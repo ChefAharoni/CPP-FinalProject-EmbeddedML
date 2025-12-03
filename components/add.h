@@ -8,14 +8,9 @@
 
 #include <cstddef>
 #include <algorithm>
+#include "fully_connected.h"  // For ActivationType
 
 namespace embedded_ml {
-
-// Activation function types (matching TFLite)
-enum class ActivationType {
-    NONE,
-    RELU
-};
 
 // Helper function to apply activation
 template<typename T>

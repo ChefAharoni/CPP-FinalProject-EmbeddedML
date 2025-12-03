@@ -29,15 +29,30 @@ using namespace std;
 
 namespace {
 
+// Helper to get the actual builtin code (handles schema v3 compatibility)
+// For v3 models, builtin_code defaults to 0, so we need to check deprecated_builtin_code
+// For newer models, builtin_code contains the actual value
+tflite::BuiltinOperator GetActualBuiltinCode(const tflite::OperatorCode* op_code) {
+    if (!op_code) {
+        return tflite::BuiltinOperator_CUSTOM;
+    }
+    // Use max of both fields to handle schema version compatibility
+    // v3 models use deprecated_builtin_code, newer models use builtin_code
+    return static_cast<tflite::BuiltinOperator>(
+        std::max(static_cast<int>(op_code->builtin_code()),
+                 static_cast<int>(op_code->deprecated_builtin_code())));
+}
+
 // Helper to get operator name from FlatBuffer
 string GetOperatorName(const tflite::OperatorCode* op_code) {
     if (!op_code) {
         return "UNKNOWN";
     }
     
-    if (op_code->builtin_code() != tflite::BuiltinOperator_CUSTOM) {
-        const char* name = tflite::EnumNameBuiltinOperator(
-            static_cast<tflite::BuiltinOperator>(op_code->builtin_code()));
+    tflite::BuiltinOperator builtin_code = GetActualBuiltinCode(op_code);
+    
+    if (builtin_code != tflite::BuiltinOperator_CUSTOM) {
+        const char* name = tflite::EnumNameBuiltinOperator(builtin_code);
         return name ? name : "UNKNOWN";
     } else {
         string result = "CUSTOM:";
@@ -120,8 +135,9 @@ bool ValidateModelSchema(const tflite::Model* model) {
     }
 
     bool ok = true;
-    vector<string> unsupported_ops;
+    vector<pair<int, string>> unsupported_ops; // (operator_index, operator_name)
     vector<pair<int, int>> unsupported_activations; // (operator_index, activation_code)
+    const auto* tensors = subgraph->tensors();
 
     // Set of supported operators
     set<tflite::BuiltinOperator> supported_ops = {
@@ -152,15 +168,23 @@ bool ValidateModelSchema(const tflite::Model* model) {
         }
 
         const tflite::OperatorCode* op_code = op_codes->Get(op_code_index);
-        if (!op_code) continue;
+        if (!op_code) {
+            cerr << "Warning: Operator " << i << " has null operator code" << endl;
+            ok = false;
+            continue;
+        }
 
-        tflite::BuiltinOperator builtin_code = 
-            static_cast<tflite::BuiltinOperator>(op_code->builtin_code());
+        // Get actual builtin code (handles schema v3 compatibility)
+        // For v3 models, builtin_code defaults to 0, so we need to check deprecated_builtin_code
+        // For newer models, builtin_code contains the actual value
+        tflite::BuiltinOperator builtin_code = static_cast<tflite::BuiltinOperator>(
+            std::max(static_cast<int>(op_code->builtin_code()),
+                     static_cast<int>(op_code->deprecated_builtin_code())));
 
         // Check if operator is supported
         if (supported_ops.find(builtin_code) == supported_ops.end()) {
             string op_name;
-            if (op_code->builtin_code() == tflite::BuiltinOperator_CUSTOM) {
+            if (builtin_code == tflite::BuiltinOperator_CUSTOM) {
                 op_name = string("CUSTOM:") + 
                     (op_code->custom_code() ? op_code->custom_code()->c_str() : "");
                 // Check if it's a supported custom operator (DROPOUT or FLATTEN)
@@ -176,7 +200,30 @@ bool ValidateModelSchema(const tflite::Model* model) {
                 const char* op_name_ptr = tflite::EnumNameBuiltinOperator(builtin_code);
                 op_name = op_name_ptr ? op_name_ptr : "UNKNOWN";
             }
-            unsupported_ops.push_back(op_name + " (at operator " + to_string(i) + ")");
+            
+            // Collect detailed information about this unsupported operator
+            string op_details = op_name;
+            if (tensors && op->inputs() && op->inputs()->size() > 0) {
+                op_details += " (inputs: ";
+                for (size_t j = 0; j < op->inputs()->size(); ++j) {
+                    int input_idx = op->inputs()->Get(j);
+                    if (input_idx >= 0 && input_idx < static_cast<int>(tensors->size())) {
+                        const tflite::Tensor* input_tensor = tensors->Get(input_idx);
+                        if (input_tensor && input_tensor->shape()) {
+                            op_details += "tensor[" + to_string(input_idx) + ":" + 
+                                         GetShapeString(input_tensor->shape()) + "]";
+                        } else {
+                            op_details += "tensor[" + to_string(input_idx) + "]";
+                        }
+                    } else {
+                        op_details += "tensor[" + to_string(input_idx) + "]";
+                    }
+                    if (j < op->inputs()->size() - 1) op_details += ", ";
+                }
+                op_details += ")";
+            }
+            
+            unsupported_ops.push_back({static_cast<int>(i), op_details});
             ok = false;
         }
 
@@ -237,10 +284,14 @@ bool ValidateModelSchema(const tflite::Model* model) {
         cerr << "  - FLATTEN (custom operator, converts to reshape)" << endl;
         
         if (!unsupported_ops.empty()) {
-            cerr << "\nUnsupported operators found in model:" << endl;
-            for (const auto& op : unsupported_ops) {
-                cerr << "  - " << op << endl;
+            cerr << "\n" << unsupported_ops.size() << " unsupported operator(s) found in model:" << endl;
+            cerr << "  (Operator indices are 0-based, in execution order)" << endl;
+            for (const auto& [op_idx, op_details] : unsupported_ops) {
+                cerr << "  [Operator " << op_idx << "] " << op_details << endl;
             }
+            cerr << "\n  Note: These operators appear early in the model graph." << endl;
+            cerr << "        The code generator cannot skip them as they may transform" << endl;
+            cerr << "        tensor shapes or data that subsequent operations depend on." << endl;
         }
         
         if (!unsupported_activations.empty()) {
@@ -252,7 +303,11 @@ bool ValidateModelSchema(const tflite::Model* model) {
         }
         
         cerr << "\nCode generation aborted." << endl;
-        cerr << "Please use a model that only contains supported operations." << endl;
+        cerr << "\nTo fix this issue:" << endl;
+        cerr << "  1. Use a model that only contains supported operations, OR" << endl;
+        cerr << "  2. Request support for the missing operators to be added to the code generator" << endl;
+        cerr << "\nThe model structure cannot be partially generated - all operations" << endl;
+        cerr << "must be supported for correct code generation." << endl;
         cerr << "================================================\n" << endl;
     }
 
@@ -491,7 +546,8 @@ TfLitePadding ConvertPadding(tflite::Padding padding) {
 }
 
 // Generate model.cpp
-void GenerateModelFile(
+// Returns true on success, false on failure
+bool GenerateModelFile(
     const string& output_path,
     const string& base_name,
     const tflite::Model* model,
@@ -505,8 +561,11 @@ void GenerateModelFile(
     ofstream out(output_path);
     if (!out) {
         cerr << "Error: Cannot create file " << output_path << endl;
-        return;
+        return false;
     }
+    
+    bool generation_failed = false;
+    vector<string> generation_errors;
     
     out << "// " << base_name << ".cpp\n";
     out << "// Auto-generated inference model implementation\n";
@@ -523,7 +582,7 @@ void GenerateModelFile(
     
     if (!operators || !operator_codes || !tensors) {
         cerr << "Error: Invalid model structure" << endl;
-        return;
+        return false;
     }
     
     // Check which components are needed
@@ -681,7 +740,11 @@ void GenerateModelFile(
             if (weights_tensor_idx >= 0 && bias_tensor_idx >= 0) {
                 if (tensor_to_weight.find(weights_tensor_idx) == tensor_to_weight.end() ||
                     tensor_to_weight.find(bias_tensor_idx) == tensor_to_weight.end()) {
-                    cerr << "Warning: Cannot find weight/bias tensors for layer " << i << endl;
+                    string error_msg = "FULLY_CONNECTED layer " + to_string(i) + 
+                        " missing required weight/bias tensors (weights_idx=" + 
+                        to_string(weights_tensor_idx) + ", bias_idx=" + to_string(bias_tensor_idx) + ")";
+                    generation_errors.push_back(error_msg);
+                    generation_failed = true;
                     continue;
                 }
                 
@@ -719,7 +782,10 @@ void GenerateModelFile(
                     << fc_input_size << ", " << output_size_layer << ", " 
                     << activation_param << ");\n";
             } else {
-                cerr << "Warning: FULLY_CONNECTED layer " << i << " missing weights/bias" << endl;
+                string error_msg = "FULLY_CONNECTED layer " + to_string(i) + 
+                    " has insufficient inputs (expected at least 3: input, weights, bias)";
+                generation_errors.push_back(error_msg);
+                generation_failed = true;
             }
         } else if (op_name == "RELU") {
             out << "        ReLU(" << input_ptr << ", " << output_ptr << ", " 
@@ -939,30 +1005,52 @@ void GenerateModelFile(
                 << ", " << output_ptr << ", " << output_size_layer << ");\n";
         } else if (op_name == "ADD") {
             // ADD has two inputs: [input1, input2]
-            int input1_tensor_idx = -1;
-            int input2_tensor_idx = -1;
-            
-            if (op_inputs && op_inputs->size() >= 2) {
-                input1_tensor_idx = op_inputs->Get(0);
-                input2_tensor_idx = op_inputs->Get(1);
+            if (!op_inputs || op_inputs->size() < 2) {
+                string error_msg = "ADD layer " + to_string(i) + " missing inputs: ";
+                error_msg += "expected 2 inputs, but ";
+                if (!op_inputs) {
+                    error_msg += "no input list provided";
+                } else {
+                    error_msg += "only " + to_string(op_inputs->size()) + " provided";
+                }
+                generation_errors.push_back(error_msg);
+                generation_failed = true;
+                continue;
             }
             
+            int input1_tensor_idx = op_inputs->Get(0);
+            int input2_tensor_idx = op_inputs->Get(1);
+            
             if (input1_tensor_idx < 0 || input2_tensor_idx < 0) {
-                cerr << "Warning: ADD layer " << i << " missing inputs" << endl;
+                string error_msg = "ADD layer " + to_string(i) + " missing inputs: ";
+                error_msg += "input1=" + to_string(input1_tensor_idx) + ", input2=" + to_string(input2_tensor_idx);
+                error_msg += " (negative indices indicate optional/unused tensors, which are not supported)";
+                generation_errors.push_back(error_msg);
+                generation_failed = true;
                 continue;
             }
             
             // Determine input pointers
+            // Check if inputs are weight tensors, model input, or intermediate buffers
             string input1_ptr, input2_ptr;
+            
             if (input1_tensor_idx == input_tensor_idx) {
                 input1_ptr = "input";
+            } else if (tensor_to_weight.find(input1_tensor_idx) != tensor_to_weight.end()) {
+                // This is a weight tensor (constant)
+                input1_ptr = tensor_to_weight.at(input1_tensor_idx);
             } else {
+                // This is an intermediate buffer
                 input1_ptr = "buffer_" + to_string(input1_tensor_idx);
             }
             
             if (input2_tensor_idx == input_tensor_idx) {
                 input2_ptr = "input";
+            } else if (tensor_to_weight.find(input2_tensor_idx) != tensor_to_weight.end()) {
+                // This is a weight tensor (constant)
+                input2_ptr = tensor_to_weight.at(input2_tensor_idx);
             } else {
+                // This is an intermediate buffer
                 input2_ptr = "buffer_" + to_string(input2_tensor_idx);
             }
             
@@ -1023,7 +1111,24 @@ void GenerateModelFile(
     
     out << "} // namespace embedded_ml\n";
     out.close();
+    
+    // Check for generation errors
+    if (generation_failed) {
+        cerr << "\n================================================" << endl;
+        cerr << "ERROR: Code generation failed due to model structure issues!" << endl;
+        cerr << "================================================" << endl;
+        cerr << "\nThe following errors occurred during code generation:" << endl;
+        for (const auto& error : generation_errors) {
+            cerr << "  - " << error << endl;
+        }
+        cerr << "\nCode generation aborted." << endl;
+        cerr << "The generated file may be incomplete or incorrect." << endl;
+        cerr << "================================================\n" << endl;
+        return false;
+    }
+    
     cout << "Generated: " << output_path << endl;
+    return true;
 }
 
 // Generate inference.cpp
@@ -1188,9 +1293,10 @@ bool CreateDirectory(const string& path) {
 } // anonymous namespace
 
 int main(int argc, char* argv[]) {
-    if (argc != 3) {
-        cerr << "Usage: " << argv[0] << " <path_to_model.tflite> <base_name>" << endl;
+    if (argc < 3 || argc > 4) {
+        cerr << "Usage: " << argv[0] << " <path_to_model.tflite> <base_name> [--output-index=N]" << endl;
         cerr << "Example: " << argv[0] << " scripts/model.tflite my_model" << endl;
+        cerr << "Example (multi-output): " << argv[0] << " scripts/model.tflite my_model --output-index=1" << endl;
         cerr << "This will create a directory 'my_model/' containing:" << endl;
         cerr << "  - my_model_weights.cpp" << endl;
         cerr << "  - my_model.h" << endl;
@@ -1198,11 +1304,41 @@ int main(int argc, char* argv[]) {
         cerr << "  - my_model_inference.cpp" << endl;
         cerr << "  - Makefile" << endl;
         cerr << "\nTo build: cd my_model && make" << endl;
+        cerr << "\nNote: For models with multiple outputs, use --output-index=N to select" << endl;
+        cerr << "      which output tensor to use (default: 0). Only single input models are supported." << endl;
         return 1;
     }
     
     const string model_path = argv[1];
     const string base_name = argv[2];
+    int output_index = 0;  // Default to first output
+    bool output_index_specified = false;  // Track if user explicitly provided the flag
+    
+    // Parse optional output index flag
+    if (argc == 4) {
+        string flag = argv[3];
+        if (flag.find("--output-index") == 0) {
+            size_t eq_pos = flag.find('=');
+            if (eq_pos != string::npos) {
+                // Format: --output-index=N
+                string index_str = flag.substr(eq_pos + 1);
+                try {
+                    output_index = stoi(index_str);
+                    output_index_specified = true;
+                } catch (const exception& e) {
+                    cerr << "Error: Invalid output index: " << index_str << endl;
+                    return 1;
+                }
+            } else {
+                cerr << "Error: --output-index requires a value, e.g., --output-index=1" << endl;
+                return 1;
+            }
+        } else {
+            cerr << "Error: Unknown flag: " << flag << endl;
+            cerr << "Use --output-index=N to specify output tensor index" << endl;
+            return 1;
+        }
+    }
     
     // Check if file exists
     ifstream file_check(model_path, ios::binary);
@@ -1278,15 +1414,70 @@ int main(int argc, char* argv[]) {
         cerr << "Error: Invalid model structure - missing inputs/outputs" << endl;
         return 1;
     }
-    cout << "inputs->size(): " << inputs->size() << endl;
-    cout << "outputs->size(): " << outputs->size() << endl;
-    if (inputs->size() != 1 || outputs->size() != 1) {
-        cerr << "Error: Only single input/output models supported" << endl;
+    
+    // Check input count (only single input supported)
+    if (inputs->size() != 1) {
+        cerr << "Error: Only single input models are supported." << endl;
+        cerr << "This model has " << inputs->size() << " input(s)." << endl;
+        return 1;
+    }
+    
+    // Require --output-index flag for multi-output models
+    if (outputs->size() > 1 && !output_index_specified) {
+        cerr << "Error: This model has " << outputs->size() << " output(s)." << endl;
+        cerr << "You must specify which output to use with --output-index=N" << endl;
+        cerr << "\nAvailable outputs:" << endl;
+        for (size_t i = 0; i < outputs->size(); ++i) {
+            int32_t out_idx = outputs->Get(i);
+            const tflite::Tensor* out_tensor = (out_idx >= 0 && out_idx < static_cast<int>(tensors->size()))
+                ? tensors->Get(out_idx) : nullptr;
+            if (out_tensor) {
+                cerr << "  [" << i << "] Shape: [" << GetShapeString(out_tensor->shape()) << "]";
+                if (out_tensor->name()) {
+                    cerr << " Name: " << out_tensor->name()->c_str();
+                }
+                cerr << endl;
+            }
+        }
+        cerr << "\nRerun with:" << endl;
+        cerr << "  " << argv[0] << " " << model_path << " " << base_name 
+             << " --output-index=<index>" << endl;
+        return 1;
+    }
+    
+    // Check and validate output index
+    if (output_index < 0 || output_index >= static_cast<int>(outputs->size())) {
+        cerr << "Error: Invalid output index " << output_index << "." << endl;
+        cerr << "This model has " << outputs->size() << " output(s) (valid indices: 0 to " 
+             << (outputs->size() - 1) << ")." << endl;
+        if (outputs->size() > 1) {
+            cerr << "\nTo use a different output, rerun with:" << endl;
+            cerr << "  " << argv[0] << " " << model_path << " " << base_name 
+                 << " --output-index=<index>" << endl;
+            cerr << "Available outputs:" << endl;
+            for (size_t i = 0; i < outputs->size(); ++i) {
+                int32_t out_idx = outputs->Get(i);
+                const tflite::Tensor* out_tensor = (out_idx >= 0 && out_idx < static_cast<int>(tensors->size()))
+                    ? tensors->Get(out_idx) : nullptr;
+                if (out_tensor) {
+                    cerr << "  [" << i << "] Shape: [" << GetShapeString(out_tensor->shape()) << "]";
+                    if (out_tensor->name()) {
+                        cerr << " Name: " << out_tensor->name()->c_str();
+                    }
+                    cerr << endl;
+                }
+            }
+        }
         return 1;
     }
     
     int32_t input_tensor_idx = inputs->Get(0);
-    int32_t output_tensor_idx = outputs->Get(0);
+    int32_t output_tensor_idx = outputs->Get(output_index);
+    
+    if (outputs->size() > 1) {
+        cout << "Note: Model has " << outputs->size() << " outputs. Using output index " 
+             << output_index << " (0-indexed)." << endl;
+    }
     
     const tflite::Tensor* input_tensor = (input_tensor_idx >= 0 && input_tensor_idx < static_cast<int>(tensors->size()))
         ? tensors->Get(input_tensor_idx) : nullptr;
@@ -1430,8 +1621,11 @@ int main(int argc, char* argv[]) {
     cout << "\nGenerating code files..." << endl;
     GenerateWeightsFile(weights_file, base_name, model, subgraph, tensor_to_weight);
     GenerateModelHeader(model_header_file, base_name, input_size, output_size, intermediate_buffers);
-    GenerateModelFile(model_file, base_name, model, subgraph, tensor_to_weight, intermediate_buffers, 
-                     tensor_sizes, input_tensor_idx, output_tensor_idx);
+    if (!GenerateModelFile(model_file, base_name, model, subgraph, tensor_to_weight, intermediate_buffers, 
+                           tensor_sizes, input_tensor_idx, output_tensor_idx)) {
+        cerr << "Error: Failed to generate model file. Aborting." << endl;
+        return 1;
+    }
     GenerateInferenceFile(inference_file, base_name, subgraph, input_tensor_idx, output_tensor_idx);
     GenerateMakefile(makefile, base_name);
     
