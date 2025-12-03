@@ -133,7 +133,8 @@ bool ValidateModelSchema(const tflite::Model* model) {
         tflite::BuiltinOperator_SHAPE,
         tflite::BuiltinOperator_STRIDED_SLICE,
         tflite::BuiltinOperator_PACK,
-        tflite::BuiltinOperator_RESHAPE
+        tflite::BuiltinOperator_RESHAPE,
+        tflite::BuiltinOperator_ADD
     };
 
     // Check each operator in the model
@@ -179,7 +180,7 @@ bool ValidateModelSchema(const tflite::Model* model) {
             ok = false;
         }
 
-        // For FULLY_CONNECTED and CONV_2D, check fused activation
+        // For FULLY_CONNECTED, CONV_2D, and ADD, check fused activation
         if (builtin_code == tflite::BuiltinOperator_FULLY_CONNECTED) {
             const tflite::FullyConnectedOptions* options = 
                 op->builtin_options_as_FullyConnectedOptions();
@@ -194,6 +195,17 @@ bool ValidateModelSchema(const tflite::Model* model) {
         } else if (builtin_code == tflite::BuiltinOperator_CONV_2D) {
             const tflite::Conv2DOptions* options = 
                 op->builtin_options_as_Conv2DOptions();
+            if (options) {
+                tflite::ActivationFunctionType activation = options->fused_activation_function();
+                if (activation != tflite::ActivationFunctionType_NONE &&
+                    activation != tflite::ActivationFunctionType_RELU) {
+                    unsupported_activations.push_back({static_cast<int>(i), static_cast<int>(activation)});
+                    ok = false;
+                }
+            }
+        } else if (builtin_code == tflite::BuiltinOperator_ADD) {
+            const tflite::AddOptions* options = 
+                op->builtin_options_as_AddOptions();
             if (options) {
                 tflite::ActivationFunctionType activation = options->fused_activation_function();
                 if (activation != tflite::ActivationFunctionType_NONE &&
@@ -220,6 +232,7 @@ bool ValidateModelSchema(const tflite::Model* model) {
         cerr << "  - STRIDED_SLICE" << endl;
         cerr << "  - PACK" << endl;
         cerr << "  - RESHAPE" << endl;
+        cerr << "  - ADD (with NONE or RELU activation)" << endl;
         cerr << "  - DROPOUT (custom operator, no-op during inference)" << endl;
         cerr << "  - FLATTEN (custom operator, converts to reshape)" << endl;
         
@@ -521,6 +534,7 @@ void GenerateModelFile(
     bool has_strided_slice = false;
     bool has_pack = false;
     bool has_reshape = false;
+    bool has_add = false;
     bool has_dropout = false;
     bool has_flatten = false;
     
@@ -551,6 +565,8 @@ void GenerateModelFile(
             has_pack = true;
         } else if (op_name == "RESHAPE") {
             has_reshape = true;
+        } else if (op_name == "ADD") {
+            has_add = true;
         } else if (op_name.find("DROPOUT") != string::npos || 
                    op_name.find("Dropout") != string::npos) {
             has_dropout = true;
@@ -580,6 +596,9 @@ void GenerateModelFile(
     }
     if (has_reshape) {
         out << "#include \"../../components/reshape.h\"\n";
+    }
+    if (has_add) {
+        out << "#include \"../../components/add.h\"\n";
     }
     if (has_dropout) {
         out << "#include \"../../components/dropout.h\"\n";
@@ -918,6 +937,60 @@ void GenerateModelFile(
             // RESHAPE just copies data (memory layout is the same)
             out << "        Reshape(" << input_ptr << ", " << input_size_layer 
                 << ", " << output_ptr << ", " << output_size_layer << ");\n";
+        } else if (op_name == "ADD") {
+            // ADD has two inputs: [input1, input2]
+            int input1_tensor_idx = -1;
+            int input2_tensor_idx = -1;
+            
+            if (op_inputs && op_inputs->size() >= 2) {
+                input1_tensor_idx = op_inputs->Get(0);
+                input2_tensor_idx = op_inputs->Get(1);
+            }
+            
+            if (input1_tensor_idx < 0 || input2_tensor_idx < 0) {
+                cerr << "Warning: ADD layer " << i << " missing inputs" << endl;
+                continue;
+            }
+            
+            // Determine input pointers
+            string input1_ptr, input2_ptr;
+            if (input1_tensor_idx == input_tensor_idx) {
+                input1_ptr = "input";
+            } else {
+                input1_ptr = "buffer_" + to_string(input1_tensor_idx);
+            }
+            
+            if (input2_tensor_idx == input_tensor_idx) {
+                input2_ptr = "input";
+            } else {
+                input2_ptr = "buffer_" + to_string(input2_tensor_idx);
+            }
+            
+            // Get sizes (should be the same for element-wise addition)
+            size_t input1_size = tensor_sizes.count(input1_tensor_idx) ? tensor_sizes.at(input1_tensor_idx) : output_size_layer;
+            size_t input2_size = tensor_sizes.count(input2_tensor_idx) ? tensor_sizes.at(input2_tensor_idx) : output_size_layer;
+            
+            // Use the output size as the common size (should match for element-wise ops)
+            size_t add_size = output_size_layer;
+            
+            // Check for fused activation function
+            TfLiteFusedActivation fused_activation = kTfLiteActNone;
+            const tflite::AddOptions* options = op->builtin_options_as_AddOptions();
+            if (options) {
+                fused_activation = ConvertActivation(options->fused_activation_function());
+            }
+            
+            // Determine activation parameter
+            string activation_param = "ActivationType::NONE";
+            if (fused_activation == kTfLiteActRelu) {
+                activation_param = "ActivationType::RELU";
+            } else if (fused_activation != kTfLiteActNone) {
+                cerr << "Warning: Unsupported fused activation " << static_cast<int>(fused_activation) 
+                     << " in ADD layer " << i << " (only ReLU supported, using NONE)" << endl;
+            }
+            
+            out << "        Add(" << input1_ptr << ", " << input2_ptr << ", " 
+                << output_ptr << ", " << add_size << ", " << activation_param << ");\n";
         } else if (op_name.find("DROPOUT") != string::npos || 
                    op_name.find("Dropout") != string::npos) {
             // Get dropout rate if available (though it's ignored during inference)
@@ -1205,7 +1278,8 @@ int main(int argc, char* argv[]) {
         cerr << "Error: Invalid model structure - missing inputs/outputs" << endl;
         return 1;
     }
-    
+    cout << "inputs->size(): " << inputs->size() << endl;
+    cout << "outputs->size(): " << outputs->size() << endl;
     if (inputs->size() != 1 || outputs->size() != 1) {
         cerr << "Error: Only single input/output models supported" << endl;
         return 1;
