@@ -20,10 +20,16 @@
 #define mkdir(path, mode) _mkdir(path)
 #endif
 
+// Template engine
+#include <inja/inja.hpp>
+#include <nlohmann/json.hpp>
+
 // TensorFlow Lite FlatBuffer schema header
 #include "tensorflow/lite/schema/schema_generated.h"
 // Only need builtin_op_data for activation/padding enums
 #include "tensorflow/lite/c/builtin_op_data.h"
+
+using json = nlohmann::json;
 
 using namespace std;
 
@@ -370,33 +376,38 @@ map<int, string> CreateWeightMapping(
 }
 
 // Generate model_weights.cpp
-void GenerateWeightsFile(
+// Returns true on success, false on failure
+bool GenerateWeightsFile(
     const string& output_path,
     const string& base_name,
     const tflite::Model* model,
     const tflite::SubGraph* subgraph,
     const map<int, string>& tensor_to_weight
 ) {
-    ofstream out(output_path);
-    if (!out) {
-        cerr << "Error: Cannot create file " << output_path << endl;
-        return;
-    }
-    
-    out << "// " << base_name << "_weights.cpp\n";
-    out << "// Auto-generated weight data for embedded inference\n";
-    out << "// This file contains all model weights as C++ arrays\n\n";
-    out << "#include <cstddef>\n\n";
-    out << "namespace embedded_ml {\n\n";
+    inja::Environment env;
     
     const auto* tensors = subgraph->tensors();
     const auto* buffers = model->buffers();
     
     if (!tensors || !buffers) {
-        out << "} // namespace embedded_ml\n";
-        out.close();
-        return;
+        // Create empty file
+        ofstream out(output_path);
+        if (out) {
+            out << "// " << base_name << "_weights.cpp\n";
+            out << "// Auto-generated weight data for embedded inference\n\n";
+            out << "#include <cstddef>\n\n";
+            out << "namespace embedded_ml {\n\n";
+            out << "} // namespace embedded_ml\n";
+            out.close();
+            cout << "Generated: " << output_path << endl;
+            return true;
+        }
+        return false;
     }
+    
+    json data;
+    data["base_name"] = base_name;
+    data["weights"] = json::array();
     
     for (size_t i = 0; i < tensors->size(); ++i) {
         if (tensor_to_weight.find(static_cast<int>(i)) == tensor_to_weight.end()) {
@@ -429,53 +440,73 @@ void GenerateWeightsFile(
             continue;
         }
         
-        const float* data = reinterpret_cast<const float*>(data_vec->data());
+        const float* float_data = reinterpret_cast<const float*>(data_vec->data());
         
-        out << "// Weight tensor " << i << ": " << tensor_name << "\n";
-        out << "// Shape: [" << GetShapeString(tensor->shape()) << "]\n";
-        out << "// Elements: " << num_elements << "\n";
-        out << "static const float " << var_name << "[" << num_elements << "] = {\n";
-        out << fixed << setprecision(9);
+        json weight;
+        weight["tensor_index"] = static_cast<int>(i);
+        weight["tensor_name"] = tensor_name;
+        weight["var_name"] = var_name;
+        weight["shape"] = GetShapeString(tensor->shape());
+        weight["num_elements"] = num_elements;
         
+        // Format float values with precision and track newline positions
+        ostringstream value_stream;
+        value_stream << fixed << setprecision(9);
+        weight["values"] = json::array();
         for (size_t j = 0; j < num_elements; ++j) {
-            out << "  " << data[j];
-            if (j < num_elements - 1) {
-                out << ",";
-            }
-            if ((j + 1) % 8 == 0) {
-                out << "\n";
-            } else {
-                out << " ";
-            }
+            json value_obj;
+            value_stream.str("");
+            value_stream << float_data[j];
+            value_obj["value"] = value_stream.str();
+            value_obj["needs_newline"] = ((j + 1) % 8 == 0);
+            value_obj["is_last"] = (j == num_elements - 1);
+            weight["values"].push_back(value_obj);
         }
-        if (num_elements % 8 != 0) {
-            out << "\n";
-        }
-        out << "};\n\n";
+        
+        data["weights"].push_back(weight);
     }
     
-    out << "} // namespace embedded_ml\n";
-    out.close();
-    cout << "Generated: " << output_path << endl;
+    // Load and render template
+    ifstream template_file("templates/weights.cpp.inja");
+    if (!template_file) {
+        cerr << "Error: Cannot open template file templates/weights.cpp.inja" << endl;
+        return false;
+    }
+    
+    string template_content((istreambuf_iterator<char>(template_file)),
+                           istreambuf_iterator<char>());
+    template_file.close();
+    
+    try {
+        inja::Template temp = env.parse(template_content);
+        string result = env.render(temp, data);
+        
+        ofstream out(output_path);
+        if (!out) {
+            cerr << "Error: Cannot create file " << output_path << endl;
+            return false;
+        }
+        
+        out << result;
+        out.close();
+        cout << "Generated: " << output_path << endl;
+        return true;
+    } catch (const exception& e) {
+        cerr << "Error: Template rendering failed: " << e.what() << endl;
+        return false;
+    }
 }
 
 // Generate model.h (header file)
-void GenerateModelHeader(
+// Returns true on success, false on failure
+bool GenerateModelHeader(
     const string& output_path,
     const string& base_name,
     size_t input_size,
     size_t output_size,
     const vector<pair<int, size_t>>& intermediate_buffers
 ) {
-    ofstream out(output_path);
-    if (!out) {
-        cerr << "Error: Cannot create file " << output_path << endl;
-        return;
-    }
-    
-    out << "// " << base_name << ".h\n";
-    out << "// Auto-generated inference model header\n";
-    out << "// Pure C++ implementation for embedded systems\n\n";
+    inja::Environment env;
     
     // Create include guard name (uppercase, with underscores)
     string guard_name = base_name;
@@ -487,40 +518,49 @@ void GenerateModelHeader(
     }
     guard_name += "_MODEL_H";
     
-    out << "#ifndef " << guard_name << "\n";
-    out << "#define " << guard_name << "\n\n";
+    json data;
+    data["base_name"] = base_name;
+    data["guard_name"] = guard_name;
+    data["input_size"] = input_size;
+    data["output_size"] = output_size;
+    data["intermediate_buffers"] = json::array();
     
-    out << "#include <cstddef>\n\n";
-    
-    out << "namespace embedded_ml {\n\n";
-    
-    out << "class " << base_name << "Model {\n";
-    out << "public:\n";
-    out << "    static constexpr size_t kInputSize = " << input_size << ";\n";
-    out << "    static constexpr size_t kOutputSize = " << output_size << ";\n\n";
-    
-    // Declare intermediate buffers as static class members
-    if (!intermediate_buffers.empty()) {
-        out << "private:\n";
-        out << "    // Intermediate buffers for layer outputs\n";
-        for (const auto& [idx, size] : intermediate_buffers) {
-            out << "    static float buffer_" << idx << "[" << size << "];\n";
-        }
-        out << "\n";
+    for (const auto& [idx, size] : intermediate_buffers) {
+        json buffer;
+        buffer["index"] = idx;
+        buffer["size"] = size;
+        data["intermediate_buffers"].push_back(buffer);
     }
     
-    out << "public:\n";
-    out << "    // Run inference on input data\n";
-    out << "    // input: array of size kInputSize\n";
-    out << "    // output: array of size kOutputSize (will be filled with results)\n";
-    out << "    static void Inference(const float* input, float* output);\n";
-    out << "};\n\n";
+    // Load and render template
+    ifstream template_file("templates/model.h.inja");
+    if (!template_file) {
+        cerr << "Error: Cannot open template file templates/model.h.inja" << endl;
+        return false;
+    }
     
-    out << "} // namespace embedded_ml\n\n";
-    out << "#endif // " << guard_name << "\n";
+    string template_content((istreambuf_iterator<char>(template_file)),
+                           istreambuf_iterator<char>());
+    template_file.close();
     
-    out.close();
-    cout << "Generated: " << output_path << endl;
+    try {
+        inja::Template temp = env.parse(template_content);
+        string result = env.render(temp, data);
+        
+        ofstream out(output_path);
+        if (!out) {
+            cerr << "Error: Cannot create file " << output_path << endl;
+            return false;
+        }
+        
+        out << result;
+        out.close();
+        cout << "Generated: " << output_path << endl;
+        return true;
+    } catch (const exception& e) {
+        cerr << "Error: Template rendering failed: " << e.what() << endl;
+        return false;
+    }
 }
 
 // Convert FlatBuffer activation to TfLite activation enum
@@ -558,23 +598,10 @@ bool GenerateModelFile(
     int32_t input_tensor_idx,
     int32_t output_tensor_idx
 ) {
-    ofstream out(output_path);
-    if (!out) {
-        cerr << "Error: Cannot create file " << output_path << endl;
-        return false;
-    }
+    inja::Environment env;
     
     bool generation_failed = false;
     vector<string> generation_errors;
-    
-    out << "// " << base_name << ".cpp\n";
-    out << "// Auto-generated inference model implementation\n";
-    out << "// Pure C++ implementation for embedded systems\n\n";
-    
-    // Include header and weights
-    out << "#include \"" << base_name << ".h\"\n";
-    out << "#include \"" << base_name << "_weights.cpp\"\n";
-    out << "#include \"../../components/fully_connected.h\"\n";
     
     const auto* operators = subgraph->operators();
     const auto* operator_codes = model->operator_codes();
@@ -597,82 +624,21 @@ bool GenerateModelFile(
     bool has_dropout = false;
     bool has_flatten = false;
     
-    for (size_t i = 0; i < operators->size(); ++i) {
-        const tflite::Operator* op = operators->Get(i);
-        if (!op) continue;
-        
-        int op_code_index = op->opcode_index();
-        if (op_code_index < 0 || op_code_index >= static_cast<int>(operator_codes->size())) {
-            continue;
-        }
-        
-        const tflite::OperatorCode* op_code = operator_codes->Get(op_code_index);
-        if (!op_code) continue;
-        
-        string op_name = GetOperatorName(op_code);
-        if (op_name == "RELU") {
-            has_standalone_relu = true;
-        } else if (op_name == "CONV_2D") {
-            has_conv2d = true;
-        } else if (op_name == "MAX_POOL_2D") {
-            has_max_pool2d = true;
-        } else if (op_name == "SHAPE") {
-            has_shape = true;
-        } else if (op_name == "STRIDED_SLICE") {
-            has_strided_slice = true;
-        } else if (op_name == "PACK") {
-            has_pack = true;
-        } else if (op_name == "RESHAPE") {
-            has_reshape = true;
-        } else if (op_name == "ADD") {
-            has_add = true;
-        } else if (op_name.find("DROPOUT") != string::npos || 
-                   op_name.find("Dropout") != string::npos) {
-            has_dropout = true;
-        } else if (op_name.find("FLATTEN") != string::npos ||
-                   op_name.find("Flatten") != string::npos) {
-            has_flatten = true;
-        }
-    }
-    
-    if (has_standalone_relu) {
-        out << "#include \"../../components/relu.h\"\n";
-    }
-    if (has_conv2d) {
-        out << "#include \"../../components/conv_2d.h\"\n";
-    }
-    if (has_max_pool2d) {
-        out << "#include \"../../components/max_pool_2d.h\"\n";
-    }
-    if (has_shape) {
-        out << "#include \"../../components/shape.h\"\n";
-    }
-    if (has_strided_slice) {
-        out << "#include \"../../components/strided_slice.h\"\n";
-    }
-    if (has_pack) {
-        out << "#include \"../../components/pack.h\"\n";
-    }
-    if (has_reshape) {
-        out << "#include \"../../components/reshape.h\"\n";
-    }
-    if (has_add) {
-        out << "#include \"../../components/add.h\"\n";
-    }
-    if (has_dropout) {
-        out << "#include \"../../components/dropout.h\"\n";
-    }
-    if (has_flatten) {
-        out << "#include \"../../components/flatten.h\"\n";
-    }
-    
-    out << "#include \"../../components/softmax.h\"\n";
-    out << "#include <cstddef>\n\n";
-    
-    out << "namespace embedded_ml {\n\n";
-    
-    // Implementation of Inference method
-    out << "void " << base_name << "Model::Inference(const float* input, float* output) {\n";
+    // Build JSON data structure
+    json data;
+    data["base_name"] = base_name;
+    data["has_standalone_relu"] = false;
+    data["has_conv2d"] = false;
+    data["has_max_pool2d"] = false;
+    data["has_shape"] = false;
+    data["has_strided_slice"] = false;
+    data["has_pack"] = false;
+    data["has_reshape"] = false;
+    data["has_add"] = false;
+    data["has_dropout"] = false;
+    data["has_flatten"] = false;
+    data["layers"] = json::array();
+    data["intermediate_buffers"] = json::array();
     
     // Process each operator in order (this is the execution plan)
     for (size_t i = 0; i < operators->size(); ++i) {
@@ -689,7 +655,42 @@ bool GenerateModelFile(
         
         string op_name = GetOperatorName(op_code);
         
-        out << "        // Layer " << i << ": " << op_name << "\n";
+        // Track which components are needed
+        if (op_name == "RELU") {
+            has_standalone_relu = true;
+            data["has_standalone_relu"] = true;
+        } else if (op_name == "CONV_2D") {
+            has_conv2d = true;
+            data["has_conv2d"] = true;
+        } else if (op_name == "MAX_POOL_2D") {
+            has_max_pool2d = true;
+            data["has_max_pool2d"] = true;
+        } else if (op_name == "SHAPE") {
+            has_shape = true;
+            data["has_shape"] = true;
+        } else if (op_name == "STRIDED_SLICE") {
+            has_strided_slice = true;
+            data["has_strided_slice"] = true;
+        } else if (op_name == "PACK") {
+            has_pack = true;
+            data["has_pack"] = true;
+        } else if (op_name == "RESHAPE") {
+            has_reshape = true;
+            data["has_reshape"] = true;
+        } else if (op_name == "ADD") {
+            has_add = true;
+            data["has_add"] = true;
+        } else if (op_name.find("DROPOUT") != string::npos || 
+                   op_name.find("Dropout") != string::npos) {
+            has_dropout = true;
+            data["has_dropout"] = true;
+            op_name = "DROPOUT";  // Normalize name
+        } else if (op_name.find("FLATTEN") != string::npos ||
+                   op_name.find("Flatten") != string::npos) {
+            has_flatten = true;
+            data["has_flatten"] = true;
+            op_name = "FLATTEN";  // Normalize name
+        }
         
         // Get input/output tensor indices
         const auto* op_inputs = op->inputs();
@@ -725,6 +726,15 @@ bool GenerateModelFile(
         
         size_t input_size_layer = tensor_sizes.count(op_input_tensor_idx) ? tensor_sizes.at(op_input_tensor_idx) : 0;
         size_t output_size_layer = tensor_sizes.count(op_output_tensor_idx) ? tensor_sizes.at(op_output_tensor_idx) : 0;
+        
+        // Build layer JSON based on operation type
+        json layer;
+        layer["index"] = static_cast<int>(i);
+        layer["op_name"] = op_name;
+        layer["input_ptr"] = input_ptr;
+        layer["output_ptr"] = output_ptr;
+        layer["input_size"] = input_size_layer;
+        layer["output_size"] = output_size_layer;
         
         // Generate code based on operation
         if (op_name == "FULLY_CONNECTED") {
@@ -777,22 +787,19 @@ bool GenerateModelFile(
                          << " in FULLY_CONNECTED layer " << i << " (only ReLU supported, using NONE)" << endl;
                 }
                 
-                out << "        FullyConnected(" << input_ptr << ", " << weights_var 
-                    << ", " << bias_var << ", " << output_ptr << ", " 
-                    << fc_input_size << ", " << output_size_layer << ", " 
-                    << activation_param << ");\n";
+                layer["weights_var"] = weights_var;
+                layer["bias_var"] = bias_var;
+                layer["fc_input_size"] = fc_input_size;
+                layer["activation_param"] = activation_param;
             } else {
                 string error_msg = "FULLY_CONNECTED layer " + to_string(i) + 
                     " has insufficient inputs (expected at least 3: input, weights, bias)";
                 generation_errors.push_back(error_msg);
                 generation_failed = true;
+                continue;
             }
-        } else if (op_name == "RELU") {
-            out << "        ReLU(" << input_ptr << ", " << output_ptr << ", " 
-                << output_size_layer << ");\n";
-        } else if (op_name == "SOFTMAX") {
-            out << "        Softmax(" << input_ptr << ", " << output_ptr << ", " 
-                << output_size_layer << ");\n";
+        } else if (op_name == "RELU" || op_name == "SOFTMAX") {
+            // Simple operations, already have all needed fields
         } else if (op_name == "CONV_2D") {
             // CONV_2D has inputs: [input, filter, bias]
             int filter_tensor_idx = -1;
@@ -835,8 +842,6 @@ bool GenerateModelFile(
                 size_t filter_height = filter_tensor->shape()->Get(1);
                 size_t filter_width = filter_tensor->shape()->Get(2);
                 size_t output_channels = filter_tensor->shape()->Get(0);
-                size_t output_height = output_tensor->shape()->Get(1);
-                size_t output_width = output_tensor->shape()->Get(2);
                 
                 // Get convolution parameters
                 TfLitePadding padding = kTfLitePaddingSame;
@@ -861,15 +866,24 @@ bool GenerateModelFile(
                 string activation_param = (fused_activation == kTfLiteActRelu) ? 
                     "ActivationType::RELU" : "ActivationType::NONE";
                 
-                out << "        Conv2D(" << input_ptr << ", " << filter_var << ", " 
-                    << bias_var << ", " << output_ptr << ", "
-                    << batch_size << ", " << input_height << ", " << input_width << ", " 
-                    << input_channels << ", " << filter_height << ", " << filter_width << ", "
-                    << output_channels << ", " << stride_height << ", " << stride_width << ", "
-                    << padding_param << ", " << activation_param << ", "
-                    << dilation_height << ", " << dilation_width << ");\n";
+                layer["filter_var"] = filter_var;
+                layer["bias_var"] = bias_var;
+                layer["batch_size"] = batch_size;
+                layer["input_height"] = input_height;
+                layer["input_width"] = input_width;
+                layer["input_channels"] = input_channels;
+                layer["filter_height"] = filter_height;
+                layer["filter_width"] = filter_width;
+                layer["output_channels"] = output_channels;
+                layer["stride_height"] = stride_height;
+                layer["stride_width"] = stride_width;
+                layer["padding_param"] = padding_param;
+                layer["activation_param"] = activation_param;
+                layer["dilation_height"] = dilation_height;
+                layer["dilation_width"] = dilation_width;
             } else {
                 cerr << "Warning: CONV_2D layer " << i << " missing filter/bias" << endl;
+                continue;
             }
         } else if (op_name == "MAX_POOL_2D") {
             // Get tensor shapes
@@ -913,11 +927,16 @@ bool GenerateModelFile(
             string activation_param = (fused_activation == kTfLiteActRelu) ? 
                 "ActivationType::RELU" : "ActivationType::NONE";
             
-            out << "        MaxPool2D(" << input_ptr << ", " << output_ptr << ", "
-                << batch_size << ", " << input_height << ", " << input_width << ", "
-                << channels << ", " << filter_height << ", " << filter_width << ", "
-                << stride_height << ", " << stride_width << ", "
-                << padding_param << ", " << activation_param << ");\n";
+            layer["batch_size"] = batch_size;
+            layer["input_height"] = input_height;
+            layer["input_width"] = input_width;
+            layer["channels"] = channels;
+            layer["filter_height"] = filter_height;
+            layer["filter_width"] = filter_width;
+            layer["stride_height"] = stride_height;
+            layer["stride_width"] = stride_width;
+            layer["padding_param"] = padding_param;
+            layer["activation_param"] = activation_param;
         } else if (op_name == "SHAPE") {
             // SHAPE extracts the shape of the input tensor
             const tflite::Tensor* input_tensor = (op_input_tensor_idx >= 0 && op_input_tensor_idx < static_cast<int>(tensors->size()))
@@ -929,80 +948,26 @@ bool GenerateModelFile(
             }
             
             int num_dims = input_tensor->shape()->size();
-            out << "        // SHAPE: Extract shape from input tensor\n";
-            out << "        {\n";
-            out << "            int32_t input_shape[" << num_dims << "] = {";
+            ostringstream shape_values;
             for (int j = 0; j < num_dims; ++j) {
-                out << input_tensor->shape()->Get(j);
-                if (j < num_dims - 1) out << ", ";
-            }
-            out << "};\n";
-            out << "            Shape(input_shape, " << num_dims << ", reinterpret_cast<int32_t*>(" << output_ptr << "));\n";
-            out << "        }\n";
-        } else if (op_name == "STRIDED_SLICE") {
-            // STRIDED_SLICE has inputs: [input, begin, end, strides]
-            const tflite::Tensor* input_tensor = (op_input_tensor_idx >= 0 && op_input_tensor_idx < static_cast<int>(tensors->size()))
-                ? tensors->Get(op_input_tensor_idx) : nullptr;
-            const tflite::Tensor* output_tensor = (op_output_tensor_idx >= 0 && op_output_tensor_idx < static_cast<int>(tensors->size()))
-                ? tensors->Get(op_output_tensor_idx) : nullptr;
-            
-            if (!input_tensor || !output_tensor ||
-                !input_tensor->shape() || !output_tensor->shape()) {
-                cerr << "Warning: Cannot get tensor shapes for STRIDED_SLICE layer " << i << endl;
-                continue;
+                shape_values << input_tensor->shape()->Get(j);
+                if (j < num_dims - 1) shape_values << ", ";
             }
             
-            // Extract parameters
-            int begin_mask = 0;
-            int end_mask = 0;
-            int shrink_axis_mask = 0;
-            
-            const tflite::StridedSliceOptions* options = op->builtin_options_as_StridedSliceOptions();
-            if (options) {
-                begin_mask = options->begin_mask();
-                end_mask = options->end_mask();
-                shrink_axis_mask = options->shrink_axis_mask();
+            layer["num_dims"] = num_dims;
+            layer["shape_values"] = shape_values.str();
+        } else if (op_name == "STRIDED_SLICE" || op_name == "PACK") {
+            // Simplified implementations - already have basic fields
+            if (op_name == "PACK") {
+                int axis = 0;
+                const tflite::PackOptions* options = op->builtin_options_as_PackOptions();
+                if (options) {
+                    axis = options->axis();
+                }
+                layer["axis"] = axis;
             }
-            
-            // For now, generate a simplified version
-            out << "        // STRIDED_SLICE: Extract slice from input\n";
-            out << "        // Note: This is a simplified implementation\n";
-            out << "        // Full implementation would extract begin/end/strides from input tensors\n";
-            out << "        // For now, copying input to output as placeholder\n";
-            out << "        for (size_t j = 0; j < " << output_size_layer << "; ++j) {\n";
-            out << "            " << output_ptr << "[j] = " << input_ptr << "[j];\n";
-            out << "        }\n";
-        } else if (op_name == "PACK") {
-            // PACK has multiple inputs to pack along an axis
-            const tflite::Tensor* output_tensor = (op_output_tensor_idx >= 0 && op_output_tensor_idx < static_cast<int>(tensors->size()))
-                ? tensors->Get(op_output_tensor_idx) : nullptr;
-            
-            if (!output_tensor || !output_tensor->shape()) {
-                cerr << "Warning: Cannot get tensor shapes for PACK layer " << i << endl;
-                continue;
-            }
-            
-            // Get axis parameter
-            int axis = 0;
-            const tflite::PackOptions* options = op->builtin_options_as_PackOptions();
-            if (options) {
-                axis = options->axis();
-            }
-            
-            // For simplicity, generate code that packs inputs
-            out << "        // PACK: Pack multiple inputs along axis " << axis << "\n";
-            out << "        // Note: This is a simplified implementation\n";
-            out << "        // Full implementation would handle multiple input tensors\n";
-            if (op_inputs && op_inputs->size() > 0) {
-                out << "        // Copying first input to output as placeholder\n";
-                out << "        for (size_t j = 0; j < " << output_size_layer << "; ++j) {\n";
-                out << "            " << output_ptr << "[j] = " << input_ptr << "[j];\n";
-                out << "        }\n";
-            }
-        } else if (op_name == "RESHAPE") {
-            // RESHAPE just copies data (memory layout is the same)
-            out << "        Reshape(" << input_ptr << ", " << input_size_layer 
-                << ", " << output_ptr << ", " << output_size_layer << ");\n";
+        } else if (op_name == "RESHAPE" || op_name == "FLATTEN") {
+            // Already have all needed fields
         } else if (op_name == "ADD") {
             // ADD has two inputs: [input1, input2]
             if (!op_inputs || op_inputs->size() < 2) {
@@ -1031,34 +996,24 @@ bool GenerateModelFile(
             }
             
             // Determine input pointers
-            // Check if inputs are weight tensors, model input, or intermediate buffers
             string input1_ptr, input2_ptr;
             
             if (input1_tensor_idx == input_tensor_idx) {
                 input1_ptr = "input";
             } else if (tensor_to_weight.find(input1_tensor_idx) != tensor_to_weight.end()) {
-                // This is a weight tensor (constant)
                 input1_ptr = tensor_to_weight.at(input1_tensor_idx);
             } else {
-                // This is an intermediate buffer
                 input1_ptr = "buffer_" + to_string(input1_tensor_idx);
             }
             
             if (input2_tensor_idx == input_tensor_idx) {
                 input2_ptr = "input";
             } else if (tensor_to_weight.find(input2_tensor_idx) != tensor_to_weight.end()) {
-                // This is a weight tensor (constant)
                 input2_ptr = tensor_to_weight.at(input2_tensor_idx);
             } else {
-                // This is an intermediate buffer
                 input2_ptr = "buffer_" + to_string(input2_tensor_idx);
             }
             
-            // Get sizes (should be the same for element-wise addition)
-            size_t input1_size = tensor_sizes.count(input1_tensor_idx) ? tensor_sizes.at(input1_tensor_idx) : output_size_layer;
-            size_t input2_size = tensor_sizes.count(input2_tensor_idx) ? tensor_sizes.at(input2_tensor_idx) : output_size_layer;
-            
-            // Use the output size as the common size (should match for element-wise ops)
             size_t add_size = output_size_layer;
             
             // Check for fused activation function
@@ -1068,7 +1023,6 @@ bool GenerateModelFile(
                 fused_activation = ConvertActivation(options->fused_activation_function());
             }
             
-            // Determine activation parameter
             string activation_param = "ActivationType::NONE";
             if (fused_activation == kTfLiteActRelu) {
                 activation_param = "ActivationType::RELU";
@@ -1077,42 +1031,30 @@ bool GenerateModelFile(
                      << " in ADD layer " << i << " (only ReLU supported, using NONE)" << endl;
             }
             
-            out << "        Add(" << input1_ptr << ", " << input2_ptr << ", " 
-                << output_ptr << ", " << add_size << ", " << activation_param << ");\n";
-        } else if (op_name.find("DROPOUT") != string::npos || 
-                   op_name.find("Dropout") != string::npos) {
-            // Get dropout rate if available (though it's ignored during inference)
+            layer["input1_ptr"] = input1_ptr;
+            layer["input2_ptr"] = input2_ptr;
+            layer["add_size"] = add_size;
+            layer["activation_param"] = activation_param;
+        } else if (op_name == "DROPOUT") {
             float dropout_rate = 0.0f;
-            
-            out << "        // DROPOUT: No-op during inference (passes through input)\n";
-            out << "        Dropout(" << input_ptr << ", " << output_ptr << ", " 
-                << output_size_layer << ", " << dropout_rate << "f);\n";
-        } else if (op_name.find("FLATTEN") != string::npos ||
-                   op_name.find("Flatten") != string::npos) {
-            // FLATTEN is essentially a reshape to 1D (except batch dimension)
-            out << "        // FLATTEN: Flatten multi-dimensional tensor to 1D\n";
-            out << "        Flatten(" << input_ptr << ", " << input_size_layer 
-                << ", " << output_ptr << ", " << output_size_layer << ");\n";
+            layer["dropout_rate"] = dropout_rate;
         } else {
             cerr << "Warning: Unsupported operation " << op_name << endl;
+            continue;
         }
+        
+        data["layers"].push_back(layer);
     }
     
-    out << "}\n\n";
-    
-    // Define static buffers outside class
-    if (!intermediate_buffers.empty()) {
-        out << "// Intermediate buffer definitions\n";
-        for (const auto& [idx, size] : intermediate_buffers) {
-            out << "float " << base_name << "Model::buffer_" << idx << "[" << size << "];\n";
-        }
-        out << "\n";
+    // Add intermediate buffers
+    for (const auto& [idx, size] : intermediate_buffers) {
+        json buffer;
+        buffer["index"] = idx;
+        buffer["size"] = size;
+        data["intermediate_buffers"].push_back(buffer);
     }
     
-    out << "} // namespace embedded_ml\n";
-    out.close();
-    
-    // Check for generation errors
+    // Check for generation errors before rendering
     if (generation_failed) {
         cerr << "\n================================================" << endl;
         cerr << "ERROR: Code generation failed due to model structure issues!" << endl;
@@ -1127,28 +1069,48 @@ bool GenerateModelFile(
         return false;
     }
     
+    // Load and render template
+    ifstream template_file("templates/model.cpp.inja");
+    if (!template_file) {
+        cerr << "Error: Cannot open template file templates/model.cpp.inja" << endl;
+        return false;
+    }
+    
+    string template_content((istreambuf_iterator<char>(template_file)),
+                           istreambuf_iterator<char>());
+    template_file.close();
+    
+    inja::Template temp = env.parse(template_content);
+    string result = env.render(temp, data);
+    
+    ofstream out(output_path);
+    if (!out) {
+        cerr << "Error: Cannot create file " << output_path << endl;
+        return false;
+    }
+    
+    out << result;
+    out.close();
+    
     cout << "Generated: " << output_path << endl;
     return true;
 }
 
 // Generate inference.cpp
-void GenerateInferenceFile(
+// Returns true on success, false on failure
+bool GenerateInferenceFile(
     const string& output_path,
     const string& base_name,
     const tflite::SubGraph* subgraph,
     int32_t input_tensor_idx,
     int32_t output_tensor_idx
 ) {
-    ofstream out(output_path);
-    if (!out) {
-        cerr << "Error: Cannot create file " << output_path << endl;
-        return;
-    }
+    inja::Environment env;
     
     const auto* tensors = subgraph->tensors();
     if (!tensors) {
         cerr << "Error: Cannot access tensors" << endl;
-        return;
+        return false;
     }
     
     const tflite::Tensor* input_tensor = (input_tensor_idx >= 0 && input_tensor_idx < static_cast<int>(tensors->size()))
@@ -1158,121 +1120,99 @@ void GenerateInferenceFile(
     
     if (!input_tensor || !output_tensor) {
         cerr << "Error: Cannot access input/output tensors" << endl;
-        return;
+        return false;
     }
     
     size_t input_size = CalculateTensorSize(input_tensor->shape());
     size_t output_size = CalculateTensorSize(output_tensor->shape());
     
-    out << "// " << base_name << "_inference.cpp\n";
-    out << "// Example inference code - edit this file to match your specific inference needs\n";
-    out << "// This is a 'hello world' example that demonstrates how to use the generated model\n\n";
+    json data;
+    data["base_name"] = base_name;
+    data["input_size"] = input_size;
+    data["output_size"] = output_size;
+    data["input_shape"] = GetShapeString(input_tensor->shape());
+    data["output_shape"] = GetShapeString(output_tensor->shape());
     
-    out << "#include \"" << base_name << ".h\"\n";
-    out << "#include <iostream>\n";
-    out << "#include <iomanip>\n";
-    out << "#include <cstddef>\n\n";
-    
-    out << "using namespace embedded_ml;\n";
-    out << "using namespace std;\n\n";
-    
-    out << "int main() {\n";
-    out << "    // Example input data matching the model's input shape\n";
-    out << "    // Shape: [" << GetShapeString(input_tensor->shape()) << "]\n";
-    out << "    // TODO: Replace this with your actual input data\n";
-    out << "    float input[" << base_name << "Model::kInputSize] = {\n";
-    
-    // Generate example input (zeros for now, user can edit)
+    // Create array for iteration with newline info (Inja doesn't support range() function)
+    data["input_indices"] = json::array();
     for (size_t i = 0; i < input_size; ++i) {
-        out << "        0.0f";
-        if (i < input_size - 1) {
-            out << ",";
-        }
-        if ((i + 1) % 8 == 0) {
-            out << "\n";
-        } else {
-            out << " ";
-        }
+        json idx_obj;
+        idx_obj["needs_newline"] = ((i + 1) % 8 == 0);
+        idx_obj["is_last"] = (i == input_size - 1);
+        data["input_indices"].push_back(idx_obj);
     }
-    if (input_size % 8 != 0) {
-        out << "\n";
+    
+    // Load and render template
+    ifstream template_file("templates/inference.cpp.inja");
+    if (!template_file) {
+        cerr << "Error: Cannot open template file templates/inference.cpp.inja" << endl;
+        return false;
     }
-    out << "    };\n\n";
     
-    out << "    // Output array to store inference results\n";
-    out << "    // Shape: [" << GetShapeString(output_tensor->shape()) << "]\n";
-    out << "    float output[" << base_name << "Model::kOutputSize];\n\n";
+    string template_content((istreambuf_iterator<char>(template_file)),
+                           istreambuf_iterator<char>());
+    template_file.close();
     
-    out << "    // Run inference\n";
-    out << "    " << base_name << "Model::Inference(input, output);\n\n";
-    
-    out << "    // Print results\n";
-    out << "    cout << \"Inference Results:\" << endl;\n";
-    out << "    cout << fixed << setprecision(6);\n";
-    out << "    for (size_t i = 0; i < " << base_name << "Model::kOutputSize; ++i) {\n";
-    out << "        cout << \"  Output[\" << i << \"] = \" << output[i] << endl;\n";
-    out << "    }\n\n";
-    
-    out << "    // TODO: Process the output results as needed for your application\n";
-    out << "    // For example, find the class with highest probability:\n";
-    out << "    // size_t predicted_class = 0;\n";
-    out << "    // float max_prob = output[0];\n";
-    out << "    // for (size_t i = 1; i < " << base_name << "Model::kOutputSize; ++i) {\n";
-    out << "    //     if (output[i] > max_prob) {\n";
-    out << "    //         max_prob = output[i];\n";
-    out << "    //         predicted_class = i;\n";
-    out << "    //     }\n";
-    out << "    // }\n";
-    out << "    // cout << \"Predicted class: \" << predicted_class << \" (probability: \" << max_prob << \")\" << endl;\n\n";
-    
-    out << "    return 0;\n";
-    out << "}\n";
-    
-    out.close();
-    cout << "Generated: " << output_path << endl;
+    try {
+        inja::Template temp = env.parse(template_content);
+        string result = env.render(temp, data);
+        
+        ofstream out(output_path);
+        if (!out) {
+            cerr << "Error: Cannot create file " << output_path << endl;
+            return false;
+        }
+        
+        out << result;
+        out.close();
+        cout << "Generated: " << output_path << endl;
+        return true;
+    } catch (const exception& e) {
+        cerr << "Error: Template rendering failed: " << e.what() << endl;
+        return false;
+    }
 }
 
 // Generate Makefile for the generated code
-void GenerateMakefile(
+// Returns true on success, false on failure
+bool GenerateMakefile(
     const string& output_path,
     const string& base_name
 ) {
-    ofstream out(output_path);
-    if (!out) {
-        cerr << "Error: Cannot create file " << output_path << endl;
-        return;
+    inja::Environment env;
+    
+    json data;
+    data["base_name"] = base_name;
+    
+    // Load and render template
+    ifstream template_file("templates/Makefile.inja");
+    if (!template_file) {
+        cerr << "Error: Cannot open template file templates/Makefile.inja" << endl;
+        return false;
     }
     
-    out << "# Makefile for " << base_name << " inference\n";
-    out << "# Auto-generated - compiles the inference executable\n\n";
+    string template_content((istreambuf_iterator<char>(template_file)),
+                           istreambuf_iterator<char>());
+    template_file.close();
     
-    out << "CXX = g++\n";
-    out << "CXXFLAGS = -std=c++17 -O2 -Wall\n\n";
-    
-    out << "# Source files\n";
-    out << "SOURCES = " << base_name << "_weights.cpp \\\n";
-    out << "          " << base_name << ".cpp \\\n";
-    out << "          " << base_name << "_inference.cpp\n\n";
-    
-    out << "# Header files\n";
-    out << "HEADERS = " << base_name << ".h\n\n";
-    
-    out << "OBJECTS = $(SOURCES:.cpp=.o)\n";
-    out << "TARGET = " << base_name << "_inference\n\n";
-    
-    out << "$(TARGET): $(OBJECTS)\n";
-    out << "\t$(CXX) $(CXXFLAGS) -o $(TARGET) $(OBJECTS)\n\n";
-    
-    out << "%.o: %.cpp\n";
-    out << "\t$(CXX) $(CXXFLAGS) -c $< -o $@\n\n";
-    
-    out << "clean:\n";
-    out << "\trm -f $(OBJECTS) $(TARGET)\n\n";
-    
-    out << ".PHONY: clean\n";
-    
-    out.close();
-    cout << "Generated: " << output_path << endl;
+    try {
+        inja::Template temp = env.parse(template_content);
+        string result = env.render(temp, data);
+        
+        ofstream out(output_path);
+        if (!out) {
+            cerr << "Error: Cannot create file " << output_path << endl;
+            return false;
+        }
+        
+        out << result;
+        out.close();
+        cout << "Generated: " << output_path << endl;
+        return true;
+    } catch (const exception& e) {
+        cerr << "Error: Template rendering failed: " << e.what() << endl;
+        return false;
+    }
 }
 
 // Create directory if it doesn't exist
@@ -1287,6 +1227,36 @@ bool CreateDirectory(const string& path) {
     return _mkdir(path.c_str()) == 0;
 #else
     return mkdir(path.c_str(), 0755) == 0;
+#endif
+}
+
+// Recursively delete a directory and all its contents
+bool DeleteDirectory(const string& path) {
+    struct stat info;
+    if (stat(path.c_str(), &info) != 0) {
+        // Directory doesn't exist, consider it "deleted"
+        return true;
+    }
+    
+    if (!S_ISDIR(info.st_mode)) {
+        // Not a directory
+        return false;
+    }
+    
+#ifdef _WIN32
+    // Windows: use system command
+    // Escape path by wrapping in quotes
+    string escaped_path = "\"" + path + "\"";
+    string cmd = "rmdir /s /q " + escaped_path;
+    int result = system(cmd.c_str());
+    return result == 0;
+#else
+    // Unix/Linux/macOS: use system command
+    // Escape path properly for shell (handle spaces and special chars)
+    string escaped_path = "\"" + path + "\"";
+    string cmd = "rm -rf " + escaped_path;
+    int result = system(cmd.c_str());
+    return result == 0;
 #endif
 }
 
@@ -1619,15 +1589,82 @@ int main(int argc, char* argv[]) {
     string makefile = output_dir + "/Makefile";
     
     cout << "\nGenerating code files..." << endl;
-    GenerateWeightsFile(weights_file, base_name, model, subgraph, tensor_to_weight);
-    GenerateModelHeader(model_header_file, base_name, input_size, output_size, intermediate_buffers);
-    if (!GenerateModelFile(model_file, base_name, model, subgraph, tensor_to_weight, intermediate_buffers, 
-                           tensor_sizes, input_tensor_idx, output_tensor_idx)) {
-        cerr << "Error: Failed to generate model file. Aborting." << endl;
+    
+    // Generate weights file
+    if (!GenerateWeightsFile(weights_file, base_name, model, subgraph, tensor_to_weight)) {
+        cerr << "\n================================================" << endl;
+        cerr << "ERROR: Failed to generate weights file!" << endl;
+        cerr << "Cleaning up created artifacts..." << endl;
+        if (DeleteDirectory(output_dir)) {
+            cerr << "Successfully removed directory: " << output_dir << endl;
+        } else {
+            cerr << "Warning: Failed to remove directory: " << output_dir << endl;
+            cerr << "Please manually delete: " << output_dir << endl;
+        }
+        cerr << "================================================\n" << endl;
         return 1;
     }
-    GenerateInferenceFile(inference_file, base_name, subgraph, input_tensor_idx, output_tensor_idx);
-    GenerateMakefile(makefile, base_name);
+    
+    // Generate model header
+    if (!GenerateModelHeader(model_header_file, base_name, input_size, output_size, intermediate_buffers)) {
+        cerr << "\n================================================" << endl;
+        cerr << "ERROR: Failed to generate model header file!" << endl;
+        cerr << "Cleaning up created artifacts..." << endl;
+        if (DeleteDirectory(output_dir)) {
+            cerr << "Successfully removed directory: " << output_dir << endl;
+        } else {
+            cerr << "Warning: Failed to remove directory: " << output_dir << endl;
+            cerr << "Please manually delete: " << output_dir << endl;
+        }
+        cerr << "================================================\n" << endl;
+        return 1;
+    }
+    
+    // Generate model file (most critical - can fail)
+    if (!GenerateModelFile(model_file, base_name, model, subgraph, tensor_to_weight, intermediate_buffers, 
+                           tensor_sizes, input_tensor_idx, output_tensor_idx)) {
+        cerr << "\n================================================" << endl;
+        cerr << "ERROR: Failed to generate model file!" << endl;
+        cerr << "Cleaning up created artifacts..." << endl;
+        if (DeleteDirectory(output_dir)) {
+            cerr << "Successfully removed directory: " << output_dir << endl;
+        } else {
+            cerr << "Warning: Failed to remove directory: " << output_dir << endl;
+            cerr << "Please manually delete: " << output_dir << endl;
+        }
+        cerr << "================================================\n" << endl;
+        return 1;
+    }
+    
+    // Generate inference file
+    if (!GenerateInferenceFile(inference_file, base_name, subgraph, input_tensor_idx, output_tensor_idx)) {
+        cerr << "\n================================================" << endl;
+        cerr << "ERROR: Failed to generate inference file!" << endl;
+        cerr << "Cleaning up created artifacts..." << endl;
+        if (DeleteDirectory(output_dir)) {
+            cerr << "Successfully removed directory: " << output_dir << endl;
+        } else {
+            cerr << "Warning: Failed to remove directory: " << output_dir << endl;
+            cerr << "Please manually delete: " << output_dir << endl;
+        }
+        cerr << "================================================\n" << endl;
+        return 1;
+    }
+    
+    // Generate Makefile
+    if (!GenerateMakefile(makefile, base_name)) {
+        cerr << "\n================================================" << endl;
+        cerr << "ERROR: Failed to generate Makefile!" << endl;
+        cerr << "Cleaning up created artifacts..." << endl;
+        if (DeleteDirectory(output_dir)) {
+            cerr << "Successfully removed directory: " << output_dir << endl;
+        } else {
+            cerr << "Warning: Failed to remove directory: " << output_dir << endl;
+            cerr << "Please manually delete: " << output_dir << endl;
+        }
+        cerr << "================================================\n" << endl;
+        return 1;
+    }
     
     cout << "\nCode generation complete!" << endl;
     cout << "Generated files in directory '" << output_dir << "':" << endl;

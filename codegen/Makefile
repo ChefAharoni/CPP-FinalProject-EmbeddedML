@@ -29,7 +29,10 @@ endif
 # Compiler flags
 CXXFLAGS = -std=c++20 \
   -I$(TFLITE_INCLUDE) \
-  -I$(FLATBUFFERS_INCLUDE)
+  -I$(FLATBUFFERS_INCLUDE) \
+  -I/opt/homebrew/opt/inja/include \
+  -I/opt/homebrew/include \
+  -I.
 
 # Linker flags
 LDFLAGS = \
