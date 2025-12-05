@@ -27,7 +27,7 @@ ifdef TFLITE_LIB_PATH
 endif
 
 # Compiler flags
-CXXFLAGS = -std=c++20 \
+CXXFLAGS = -O3 -std=c++20 \
   -I$(TFLITE_INCLUDE) \
   -I$(FLATBUFFERS_INCLUDE) \
   -I/opt/homebrew/opt/inja/include \

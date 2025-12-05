@@ -2,6 +2,7 @@
 // Fully Connected (Dense) layer component
 // Pure C++ implementation for embedded systems
 // Supports fused activation functions (matching TensorFlow/TFLite behavior)
+// Optimized with loop unrolling and restrict pointers for better performance
 
 #ifndef FULLY_CONNECTED_H
 #define FULLY_CONNECTED_H
@@ -23,102 +24,46 @@ enum class ActivationType {
 // bias: bias vector of size output_size
 // output: output vector of size output_size
 // activation: activation function to apply (NONE or RELU)
+// Optimized with loop unrolling (4 elements at a time) and restrict pointers
 template<typename T>
 void FullyConnected(
-    const T* input,
-    const T* weights,
-    const T* bias,
-    T* output,
+    const T* __restrict input,
+    const T* __restrict weights,
+    const T* __restrict bias,
+    T* __restrict output,
     size_t input_size,
     size_t output_size,
     ActivationType activation = ActivationType::NONE
 ) {
-    // Initialize output with bias
+    // For each output neuron, compute: output[i] = activation(bias[i] + input * weights[i])
+    // Fused computation: bias initialization, matrix multiplication, and activation in one pass
     for (size_t i = 0; i < output_size; ++i) {
-        output[i] = bias[i];
-    }
-    
-    // Matrix-vector multiplication: output += input * weights^T
-    // For each output neuron
-    for (size_t i = 0; i < output_size; ++i) {
-        // For each input feature
-        for (size_t j = 0; j < input_size; ++j) {
-            // weights[i * input_size + j] is weight from input j to output i
-            output[i] += input[j] * weights[i * input_size + j];
+        const T* w_row = weights + i * input_size;
+        T acc = bias[i];
+        
+        // Unrolled inner product (4 elements at a time) for better performance
+        size_t j = 0;
+        for (; j + 3 < input_size; j += 4) {
+            acc += input[j]     * w_row[j];
+            acc += input[j + 1] * w_row[j + 1];
+            acc += input[j + 2] * w_row[j + 2];
+            acc += input[j + 3] * w_row[j + 3];
         }
-    }
-    
-    // Apply fused activation function (matching TensorFlow behavior)
-    if (activation == ActivationType::RELU) {
-        for (size_t i = 0; i < output_size; ++i) {
-            output[i] = std::max(static_cast<T>(0), output[i]);
+        
+        // Handle remaining elements
+        for (; j < input_size; ++j) {
+            acc += input[j] * w_row[j];
         }
+        
+        // Apply fused activation function (matching TensorFlow behavior)
+        if (activation == ActivationType::RELU) {
+            acc = acc > static_cast<T>(0) ? acc : static_cast<T>(0);
+        }
+        
+        output[i] = acc;
     }
 }
 
 } // namespace embedded_ml
 
 #endif // FULLY_CONNECTED_H
-
-// components/fully_connected.h
-// Fully Connected (Dense) layer component
-// Pure C++ implementation for embedded systems
-// Supports fused activation functions (matching TensorFlow/TFLite behavior)
-
-#ifndef FULLY_CONNECTED_H
-#define FULLY_CONNECTED_H
-
-#include <cstddef>
-#include <algorithm>
-
-namespace embedded_ml {
-
-// Activation function types (matching TFLite)
-enum class ActivationType {
-    NONE,
-    RELU
-};
-
-// Fully Connected layer: output = activation(input * weights^T + bias)
-// input: input vector of size input_size
-// weights: weight matrix of size [output_size x input_size] (row-major)
-// bias: bias vector of size output_size
-// output: output vector of size output_size
-// activation: activation function to apply (NONE or RELU)
-template<typename T>
-void FullyConnected(
-    const T* input,
-    const T* weights,
-    const T* bias,
-    T* output,
-    size_t input_size,
-    size_t output_size,
-    ActivationType activation = ActivationType::NONE
-) {
-    // Initialize output with bias
-    for (size_t i = 0; i < output_size; ++i) {
-        output[i] = bias[i];
-    }
-    
-    // Matrix-vector multiplication: output += input * weights^T
-    // For each output neuron
-    for (size_t i = 0; i < output_size; ++i) {
-        // For each input feature
-        for (size_t j = 0; j < input_size; ++j) {
-            // weights[i * input_size + j] is weight from input j to output i
-            output[i] += input[j] * weights[i * input_size + j];
-        }
-    }
-    
-    // Apply fused activation function (matching TensorFlow behavior)
-    if (activation == ActivationType::RELU) {
-        for (size_t i = 0; i < output_size; ++i) {
-            output[i] = std::max(static_cast<T>(0), output[i]);
-        }
-    }
-}
-
-} // namespace embedded_ml
-
-#endif // FULLY_CONNECTED_H
-
