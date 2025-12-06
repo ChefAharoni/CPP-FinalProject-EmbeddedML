@@ -7,6 +7,7 @@
 #define SHAPE_H
 
 #include <cstddef>
+#include <cstdint>
 
 namespace embedded_ml {
 
