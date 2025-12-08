@@ -1,0 +1,20 @@
+// {{ base_name }}_weights.cpp
+// Auto-generated weight data for embedded inference
+// This file contains all model weights as C++ arrays
+
+#include <cstddef>
+
+namespace embedded_ml {
+
+{% for weight in weights %}
+// Weight tensor {{ weight.tensor_index }}: {{ weight.tensor_name }}
+// Shape: [{{ weight.shape }}]
+// Elements: {{ weight.num_elements }}
+static const float {{ weight.var_name }}[{{ weight.num_elements }}] = {
+{% for value_obj in weight.values %}  {{ value_obj.value }}{% if not value_obj.is_last %},{% endif %}{% if value_obj.needs_newline %}
+{% endif %}{% endfor %}
+};
+
+{%- endfor %}
+} // namespace embedded_ml
+

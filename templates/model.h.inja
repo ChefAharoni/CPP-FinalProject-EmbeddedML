@@ -1,0 +1,35 @@
+// {{ base_name }}.h
+// Auto-generated inference model header
+// Pure C++ implementation for embedded systems
+
+#ifndef {{ guard_name }}
+#define {{ guard_name }}
+
+#include <cstddef>
+
+namespace embedded_ml {
+
+class {{ base_name }}Model {
+public:
+    static constexpr size_t kInputSize = {{ input_size }};
+    static constexpr size_t kOutputSize = {{ output_size }};
+
+{%- if intermediate_buffers|length > 0 %}
+private:
+    // Intermediate buffers for layer outputs
+{% for buffer in intermediate_buffers %}
+    static float buffer_{{ buffer.index }}[{{ buffer.size }}];
+{%- endfor %}
+
+{%- endif %}
+public:
+    // Run inference on input data
+    // input: array of size kInputSize
+    // output: array of size kOutputSize (will be filled with results)
+    static void Inference(const float* input, float* output);
+};
+
+} // namespace embedded_ml
+
+#endif // {{ guard_name }}
+
