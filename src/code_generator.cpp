@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <iterator>
 #include <format>
+#include <stdexcept>
 
 void GenerateWeightsFile(
     const std::string& output_path,
@@ -680,8 +681,14 @@ void GenerateInferenceFile(
     const tflite::SubGraph* subgraph,
     int32_t input_tensor_idx,
     int32_t output_tensor_idx,
+    InferenceType inference_type,
     const std::string& templates_dir
 ) {
+    // Skip generation if inference type is None
+    if (inference_type == InferenceType::None) {
+        return;
+    }
+    
     inja::Environment env;
     
     const auto* tensors = subgraph->tensors();
@@ -716,7 +723,17 @@ void GenerateInferenceFile(
         data["input_indices"].push_back(idx_obj);
     }
     
-    std::string template_path = templates_dir + "/inference.cpp.inja";
+    // Select template based on inference type
+    std::string template_filename;
+    if (inference_type == InferenceType::Standard) {
+        template_filename = "inference.cpp.inja";
+    } else if (inference_type == InferenceType::PicoImgBench) {
+        template_filename = "inference_pico.cpp.inja";
+    } else {
+        throw CodeGenerationError("Invalid inference type for generation");
+    }
+    
+    std::string template_path = templates_dir + "/" + template_filename;
     std::ifstream template_file(template_path);
     if (!template_file) {
         throw CodeGenerationError(std::format("Cannot open template file: {}", template_path));

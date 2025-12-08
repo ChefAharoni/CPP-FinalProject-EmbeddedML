@@ -10,6 +10,13 @@
 #include <cstdint>
 #include "tensorflow/lite/schema/schema_generated.h"
 
+// Forward declaration - defined in codegen.cpp
+enum class InferenceType {
+    None,
+    Standard,
+    PicoImgBench
+};
+
 // Generate model_weights.cpp
 void GenerateWeightsFile(
     const std::string& output_path,
@@ -51,6 +58,7 @@ void GenerateInferenceFile(
     const tflite::SubGraph* subgraph,
     int32_t input_tensor_idx,
     int32_t output_tensor_idx,
+    InferenceType inference_type,
     const std::string& templates_dir = "templates"
 );
 

@@ -8,20 +8,63 @@
 #include <string>
 #include <string_view>
 #include <map>
+#include <algorithm>
+#include <numeric>
+#include <ranges>
+#include <format>
 #include "tensorflow/lite/schema/schema_generated.h"
 #include "tensorflow/lite/c/builtin_op_data.h"
 
 // Helper to get the actual builtin code (handles schema v3 compatibility)
-tflite::BuiltinOperator GetActualBuiltinCode(const tflite::OperatorCode* op_code);
+inline tflite::BuiltinOperator GetActualBuiltinCode(const tflite::OperatorCode* op_code) {
+    if (!op_code) {
+        return tflite::BuiltinOperator_CUSTOM;
+    }
+    return static_cast<tflite::BuiltinOperator>(
+        std::max(static_cast<int>(op_code->builtin_code()),
+                 static_cast<int>(op_code->deprecated_builtin_code())));
+}
 
 // Helper to get operator name from FlatBuffer
 std::string GetOperatorName(const tflite::OperatorCode* op_code);
 
 // Calculate tensor size from FlatBuffer shape
-std::size_t CalculateTensorSize(const flatbuffers::Vector<int32_t>* shape);
+inline std::size_t CalculateTensorSize(const flatbuffers::Vector<int32_t>* shape) {
+    if (!shape || shape->size() == 0) {
+        return 1;
+    }
+    
+    auto shape_view = std::ranges::views::iota(0u, shape->size())
+        | std::ranges::views::transform([shape](std::size_t i) {
+            return static_cast<std::size_t>(shape->Get(i));
+        });
+    
+    return std::accumulate(shape_view.begin(), shape_view.end(), 
+                          std::size_t{1}, std::multiplies<>{});
+}
 
 // Get shape as string from FlatBuffer
-std::string GetShapeString(const flatbuffers::Vector<int32_t>* shape);
+inline std::string GetShapeString(const flatbuffers::Vector<int32_t>* shape) {
+    if (!shape || shape->size() == 0) {
+        return "1";
+    }
+    
+    auto shape_strs = std::ranges::views::iota(0u, shape->size())
+        | std::ranges::views::transform([shape](std::size_t i) {
+            return std::to_string(shape->Get(i));
+        });
+    
+    std::string result;
+    bool first = true;
+    for (const auto& str : shape_strs) {
+        if (!first) {
+            result += ", ";
+        }
+        result += str;
+        first = false;
+    }
+    return result;
+}
 
 // Get bytes per element based on tensor type
 constexpr std::size_t GetBytesPerElement(tflite::TensorType type) {
@@ -43,7 +86,7 @@ constexpr std::size_t GetBytesPerElement(tflite::TensorType type) {
 }
 
 // Convert FlatBuffer activation to TfLite activation enum
-constexpr TfLiteFusedActivation ConvertActivation(tflite::ActivationFunctionType activation) {
+inline constexpr TfLiteFusedActivation ConvertActivation(tflite::ActivationFunctionType activation) {
     switch (activation) {
         case tflite::ActivationFunctionType_NONE: return kTfLiteActNone;
         case tflite::ActivationFunctionType_RELU: return kTfLiteActRelu;
@@ -56,7 +99,7 @@ constexpr TfLiteFusedActivation ConvertActivation(tflite::ActivationFunctionType
 }
 
 // Convert FlatBuffer padding to TfLite padding enum
-constexpr TfLitePadding ConvertPadding(tflite::Padding padding) {
+inline constexpr TfLitePadding ConvertPadding(tflite::Padding padding) {
     switch (padding) {
         case tflite::Padding_SAME: return kTfLitePaddingSame;
         case tflite::Padding_VALID: return kTfLitePaddingValid;

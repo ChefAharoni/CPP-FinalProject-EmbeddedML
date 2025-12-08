@@ -11,6 +11,8 @@
 #include <format>
 #include <filesystem>
 #include <ranges>
+#include <algorithm>
+#include <cctype>
 
 // TensorFlow includes - we only need these headers to parse the .tflite model
 #include "tensorflow/lite/schema/schema_generated.h"
@@ -22,28 +24,67 @@
 #include "code_generator.h"
 #include "filesystem_utils.h"
 
+// Helper function to parse inference type from string (case-insensitive)
+InferenceType ParseInferenceType(const std::string& str) {
+    std::string lower_str = str;
+    std::transform(lower_str.begin(), lower_str.end(), lower_str.begin(), ::tolower);
+    
+    if (lower_str == "none") {
+        return InferenceType::None;
+    } else if (lower_str == "standard") {
+        return InferenceType::Standard;
+    } else if (lower_str == "pico-img-bench") {
+        return InferenceType::PicoImgBench;
+    } else {
+        throw std::invalid_argument("Invalid inference type: " + str);
+    }
+}
+
+// Print short usage message
+void PrintShortUsage(const char* program_name) {
+    std::cerr << "Usage: " << program_name << " <path_to_model.tflite> <base_name> [OPTIONS]" << '\n';
+    std::cerr << "Use -h or --help for detailed help" << '\n';
+}
+
+// Print detailed help message
+void PrintDetailedHelp(const char* program_name) {
+    std::cerr << "Usage: " << program_name << " <path_to_model.tflite> <base_name> [OPTIONS]" << '\n';
+    std::cerr << "Example: " << program_name << " scripts/model.tflite my_model" << '\n';
+    std::cerr << "Example (multi-output): " << program_name << " scripts/model.tflite my_model --output-index=1" << '\n';
+    std::cerr << "Example (custom templates): " << program_name << " scripts/model.tflite my_model --template-path=/path/to/templates" << '\n';
+    std::cerr << "Example (Pico inference): " << program_name << " scripts/model.tflite my_model --inf=pico-img-bench" << '\n';
+    std::cerr << "This will create a directory 'my_model/' containing:" << '\n';
+    std::cerr << "  - my_model_weights.cpp" << '\n';
+    std::cerr << "  - my_model.h" << '\n';
+    std::cerr << "  - my_model.cpp" << '\n';
+    std::cerr << "  - my_model_inference.cpp (unless --inf=none)" << '\n';
+    std::cerr << "  - Makefile (unless --no-makefile is used)" << '\n';
+    std::cerr << "\nTo build: cd my_model && make" << '\n';
+    std::cerr << "\nOptions:" << '\n';
+    std::cerr << "  --output-index=N    Select output tensor index for multi-output models (default: 0). If you don't know what this is, you probably don't need it." << '\n';
+    std::cerr << "  --template-path=PATH Specify custom templates directory (default: ./templates)" << '\n';
+    std::cerr << "  --component-path=PATH Specify custom components directory (default: ./components)" << '\n';
+    std::cerr << "  --inf=TYPE          Inference script type: none, standard (default), or pico-img-bench" << '\n';
+    std::cerr << "  --no-makefile       Skip Makefile generation" << '\n';
+    std::cerr << "  --replace           Allow overwriting existing output directory" << '\n';
+    std::cerr << "  -h, --help          Show this help message" << '\n';
+    std::cerr << "\nNote: Only single input models are supported." << '\n';
+    std::cerr << "      If templates are not found in the default location, use --template-path to specify their location." << '\n';
+    std::cerr << "      If the output directory already exists, use --replace to overwrite it." << '\n';
+}
+
 int main(int argc, char* argv[]) {
+    // Check for help flag first
+    for (int i = 1; i < argc; ++i) {
+        std::string arg = argv[i];
+        if (arg == "-h" || arg == "--help") {
+            PrintDetailedHelp(argv[0]);
+            return 0;
+        }
+    }
+    
     if (argc < 3) {
-        std::cerr << "Usage: " << argv[0] << " <path_to_model.tflite> <base_name> [OPTIONS]" << '\n';
-        std::cerr << "Example: " << argv[0] << " scripts/model.tflite my_model" << '\n';
-        std::cerr << "Example (multi-output): " << argv[0] << " scripts/model.tflite my_model --output-index=1" << '\n';
-        std::cerr << "Example (custom templates): " << argv[0] << " scripts/model.tflite my_model --template-path=/path/to/templates" << '\n';
-        std::cerr << "This will create a directory 'my_model/' containing:" << '\n';
-        std::cerr << "  - my_model_weights.cpp" << '\n';
-        std::cerr << "  - my_model.h" << '\n';
-        std::cerr << "  - my_model.cpp" << '\n';
-        std::cerr << "  - my_model_inference.cpp" << '\n';
-        std::cerr << "  - Makefile (unless --no-makefile is used)" << '\n';
-        std::cerr << "\nTo build: cd my_model && make" << '\n';
-        std::cerr << "\nOptions:" << '\n';
-        std::cerr << "  --output-index=N    Select output tensor index for multi-output models (default: 0). If you don't know what this is, you probably don't need it." << '\n';
-        std::cerr << "  --template-path=PATH Specify custom templates directory (default: ./templates)" << '\n';
-        std::cerr << "  --component-path=PATH Specify custom components directory (default: ./components)" << '\n';
-        std::cerr << "  --no-makefile        Skip Makefile generation" << '\n';
-        std::cerr << "  --replace            Allow overwriting existing output directory" << '\n';
-        std::cerr << "\nNote: Only single input models are supported." << '\n';
-        std::cerr << "      If templates are not found in the default location, use --template-path to specify their location." << '\n';
-        std::cerr << "      If the output directory already exists, use --replace to overwrite it." << '\n';
+        PrintShortUsage(argv[0]);
         return 1;
     }
     
@@ -55,6 +96,7 @@ int main(int argc, char* argv[]) {
     bool template_path_specified = false;
     std::string components_dir = "components";
     bool component_path_specified = false;
+    InferenceType inference_type = InferenceType::Standard;
     bool no_makefile = false;
     bool replace = false;
     
@@ -91,20 +133,34 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Error: --component-path requires a value, e.g., --component-path=/path/to/components" << '\n';
                 return 1;
             }
+        } else if (flag.find("--inf=") == 0) {
+            std::size_t eq_pos = flag.find('=');
+            if (eq_pos != std::string::npos) {
+                std::string inf_type_str = flag.substr(eq_pos + 1);
+                try {
+                    inference_type = ParseInferenceType(inf_type_str);
+                } catch (const std::exception& e) {
+                    std::cerr << "Error: " << e.what() << '\n';
+                    std::cerr << "Valid inference types are: none, standard, pico-img-bench" << '\n';
+                    return 1;
+                }
+            } else {
+                std::cerr << "Error: --inf requires a value, e.g., --inf=standard" << '\n';
+                return 1;
+            }
         } else if (flag == "--no-makefile") {
             no_makefile = true;
         } else if (flag == "--replace") {
             replace = true;
         } else {
             std::cerr << "Error: Unknown flag: " << flag << '\n';
-            std::cerr << "Use --output-index=N, --template-path=PATH, --component-path=PATH, --no-makefile, or --replace" << '\n';
+            std::cerr << "Use -h or --help for help" << '\n';
             return 1;
         }
     }
     
     // Check if file exists
-    namespace fs = std::filesystem;
-    if (!fs::exists(model_path)) {
+    if (!std::filesystem::exists(model_path)) {
         std::cerr << std::format("Error: File does not exist: {}\n", model_path);
         return 1;
     }
@@ -248,7 +304,7 @@ int main(int argc, char* argv[]) {
     
         // Extract directory and base name from the path
         // If base_name contains a path, use the full path as output_dir and filename as file_base_name
-        fs::path base_path(base_name);
+        std::filesystem::path base_path(base_name);
         std::string output_dir = base_name;  // Use full path as output directory
         std::string file_base_name = base_path.filename().empty() ? base_name : base_path.filename().string();
         
@@ -259,7 +315,7 @@ int main(int argc, char* argv[]) {
         }
         
         // Validate templates directory
-        if (!fs::exists(templates_dir) || !fs::is_directory(templates_dir)) {
+        if (!std::filesystem::exists(templates_dir) || !std::filesystem::is_directory(templates_dir)) {
             std::string error_msg = std::format("Templates directory does not exist or is not a directory: {}", templates_dir);
             if (!template_path_specified) {
                 error_msg += "\n\nTip: If your templates are in a different location, use --template-path=PATH to specify it.";
@@ -278,8 +334,8 @@ int main(int argc, char* argv[]) {
         };
         
         for (const auto& template_file : required_templates) {
-            fs::path template_path = fs::path(templates_dir) / template_file;
-            if (!fs::exists(template_path) || !fs::is_regular_file(template_path)) {
+            std::filesystem::path template_path = std::filesystem::path(templates_dir) / template_file;
+            if (!std::filesystem::exists(template_path) || !std::filesystem::is_regular_file(template_path)) {
                 std::string error_msg = std::format("Required template file not found: {}", template_path.string());
                 if (!template_path_specified) {
                     error_msg += "\n\nTip: If your templates are in a different location, use --template-path=PATH to specify it.";
@@ -292,7 +348,7 @@ int main(int argc, char* argv[]) {
         std::cout << std::format("Using templates directory: {}\n", templates_dir);
         
         // Validate components directory
-        if (!fs::exists(components_dir) || !fs::is_directory(components_dir)) {
+        if (!std::filesystem::exists(components_dir) || !std::filesystem::is_directory(components_dir)) {
             std::string error_msg = std::format("Components directory does not exist or is not a directory: {}", components_dir);
             if (!component_path_specified) {
                 error_msg += "\n\nTip: If your components are in a different location, use --component-path=PATH to specify it.";
@@ -304,11 +360,11 @@ int main(int argc, char* argv[]) {
         std::cout << std::format("Using components directory: {}\n", components_dir);
         
         // Check if output directory exists
-        bool output_dir_exists = fs::exists(output_dir) && fs::is_directory(output_dir);
+        bool output_dir_exists = std::filesystem::exists(output_dir) && std::filesystem::is_directory(output_dir);
         
         if (output_dir_exists && !replace) {
             throw CodeGenerationError(
-                std::format("Output directory already exists: {}\nUse --replace to overwrite it.", output_dir)
+                std::format("Output directory already exists: {}\nUse --replace to overwrite files in it.", output_dir)
             );
         }
         
@@ -318,15 +374,13 @@ int main(int argc, char* argv[]) {
             );
         }
         
-        // If replacing, delete the existing directory first
-        if (output_dir_exists && replace) {
-            DeleteDirectory(output_dir);
-            std::cout << std::format("Removed existing directory: {}\n", output_dir);
-        }
-        
-        // Create output directory
+        // Create output directory (will not overwrite if it exists)
         CreateDirectory(output_dir);
-        std::cout << std::format("Created directory: {}\n", output_dir);
+        if (output_dir_exists && replace) {
+            std::cout << std::format("Using existing directory: {}\n", output_dir);
+        } else {
+            std::cout << std::format("Created directory: {}\n", output_dir);
+        }
     
         // Generate files
         std::map<int, std::string> tensor_to_weight = CreateWeightMapping(model, subgraph);
@@ -479,10 +533,10 @@ int main(int argc, char* argv[]) {
         std::cout << std::format("Copying components to {}/components/...\n", output_dir);
         
         for (const auto& component_file : needed_components) {
-            fs::path source_path = fs::path(components_dir) / component_file;
-            fs::path dest_path = fs::path(output_components_dir) / component_file;
+            std::filesystem::path source_path = std::filesystem::path(components_dir) / component_file;
+            std::filesystem::path dest_path = std::filesystem::path(output_components_dir) / component_file;
             
-            if (!fs::exists(source_path) || !fs::is_regular_file(source_path)) {
+            if (!std::filesystem::exists(source_path) || !std::filesystem::is_regular_file(source_path)) {
                 throw CodeGenerationError(
                     std::format("Required component file not found: {}", source_path.string())
                 );
@@ -510,8 +564,8 @@ int main(int argc, char* argv[]) {
         GenerateModelFile(model_file, file_base_name, model, subgraph, tensor_to_weight, intermediate_buffers, 
                            tensor_sizes, input_tensor_idx, output_tensor_idx, templates_dir);
         
-        // Generate inference file
-        GenerateInferenceFile(inference_file, file_base_name, subgraph, input_tensor_idx, output_tensor_idx, templates_dir);
+        // Generate inference file (if not None)
+        GenerateInferenceFile(inference_file, file_base_name, subgraph, input_tensor_idx, output_tensor_idx, inference_type, templates_dir);
         
         // Generate Makefile (unless --no-makefile is set)
         if (!no_makefile) {
@@ -523,12 +577,19 @@ int main(int argc, char* argv[]) {
         std::cout << std::format("  - {}_weights.cpp\n", file_base_name);
         std::cout << std::format("  - {}.h\n", file_base_name);
         std::cout << std::format("  - {}.cpp\n", file_base_name);
-        std::cout << std::format("  - {}_inference.cpp\n", file_base_name);
+        if (inference_type != InferenceType::None) {
+            std::cout << std::format("  - {}_inference.cpp\n", file_base_name);
+        }
         if (!no_makefile) {
             std::cout << "  - Makefile\n";
-            std::cout << std::format("\nTo build the inference executable:\n  cd {} && make\n", output_dir);
+            if (inference_type != InferenceType::None) {
+                std::cout << std::format("\nTo build the inference executable:\n  cd {} && make\n", output_dir);
+            }
         } else {
             std::cout << "\nNote: Makefile generation was skipped (--no-makefile flag used).\n";
+        }
+        if (inference_type == InferenceType::None) {
+            std::cout << "\nNote: Inference file generation was skipped (--inf=none flag used).\n";
         }
         std::cout << "\nNote: The generated code can be compiled independently without TFLite dependencies.\n";
         std::cout << "This code generator uses direct FlatBuffer inspection, requiring only the schema header.\n";
@@ -542,15 +603,7 @@ int main(int argc, char* argv[]) {
         std::cerr << "ERROR: Code generation failed!\n";
         std::cerr << "================================================\n";
         std::cerr << e.what() << '\n';
-        std::cerr << "\nCleaning up created artifacts...\n";
-        try {
-            // Use base_name directly as output directory for cleanup (same logic as above)
-            DeleteDirectory(base_name);
-            std::cerr << std::format("Successfully removed directory: {}\n", base_name);
-        } catch (const FileSystemError& fs_err) {
-            std::cerr << std::format("Warning: Failed to remove directory: {}\n", base_name);
-            std::cerr << std::format("Please manually delete: {}\n", base_name);
-        }
+        // Note: We do not delete the directory on error to preserve any existing files
         std::cerr << "================================================\n";
         return 1;
     } catch (const FileSystemError& e) {

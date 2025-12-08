@@ -1,0 +1,113 @@
+// {{ base_name }}_inference.cpp
+// Inference code for Raspberry Pi Pico
+// Auto-generated inference benchmark code
+
+#include "{{ base_name }}.cpp"
+#include <stdio.h>
+#include <cmath>
+#include <cstddef>
+#include "pico/stdlib.h"
+
+using namespace embedded_ml;
+
+// Simple random number generator (linear congruential generator)
+// For embedded systems without std::random
+static uint32_t lcg_state = 1;
+
+static float random_float() {
+    lcg_state = lcg_state * 1103515245 + 12345;
+    // Convert to float in [0, 1) range
+    return static_cast<float>(lcg_state & 0x7FFFFFFF) / 2147483648.0f;
+}
+
+int main() {
+    stdio_init_all();
+    
+    // Wait a bit for USB serial to be ready
+    sleep_ms(2000);
+    
+    const int num_tests = 10;
+    const float tolerance = 1e-5f;
+    
+    // Statistics
+    int total_tests = 0;
+    float max_diff_all = 0.0f;
+    
+    printf("\n=== Running %d Random Inference Tests ===\n", num_tests);
+    printf("Model: {{ base_name }} (Input: %zu, Output: %zu)\n\n", 
+           {{ base_name }}Model::kInputSize, {{ base_name }}Model::kOutputSize);
+    
+    // Allocate input and output buffers
+    float* input = (float*)malloc({{ base_name }}Model::kInputSize * sizeof(float));
+    float* output = (float*)malloc({{ base_name }}Model::kOutputSize * sizeof(float));
+    
+    if (!input || !output) {
+        printf("Error: Failed to allocate memory\n");
+        return 1;
+    }
+
+    const uint LED_PIN = 25;
+    for (int i = 0; i < 10; ++i) {
+        gpio_put(LED_PIN, 1);
+        sleep_ms(200);
+        gpio_put(LED_PIN, 0);
+        sleep_ms(200);
+    }
+    
+    for (int test = 0; test < num_tests; ++test) {
+        // Generate random input in [0,1] range (simulating normalized input)
+        for (size_t i = 0; i < {{ base_name }}Model::kInputSize; ++i) {
+            input[i] = random_float();
+        }
+        
+        // Run inference
+        {{ base_name }}Model::Inference(input, output);
+        
+        // Find predicted class
+        size_t predicted_class = 0;
+        float max_prob = output[0];
+        for (size_t i = 1; i < {{ base_name }}Model::kOutputSize; ++i) {
+            if (output[i] > max_prob) {
+                max_prob = output[i];
+                predicted_class = i;
+            }
+        }
+        
+        // Print results (compact format)
+        printf("Test %2d: Predicted class=%zu (prob=%.4f) [", 
+               test + 1, predicted_class, max_prob);
+        // Show top 3 predictions
+        for (size_t i = 0; i < {{ base_name }}Model::kOutputSize && i < 3; ++i) {
+            if (i > 0) printf(", ");
+            printf("%.3f", output[i]);
+        }
+        printf("...]\n");
+        
+        total_tests++;
+    }
+    
+    // Summary
+    printf("\n%s\n", "============================================================");
+    printf("Summary:\n");
+    printf("  Tests completed: %d/%d\n", total_tests, num_tests);
+    printf("  Max difference: %.6f\n", max_diff_all);
+    printf("  Tolerance: %.6f\n", tolerance);
+    printf("%s\n", "============================================================");
+    
+    // Cleanup
+    free(input);
+    free(output);
+    
+    // Blink LED to indicate completion (GPIO 25 on Pico)
+    gpio_init(LED_PIN);
+    gpio_set_dir(LED_PIN, GPIO_OUT);
+    
+    for (int i = 0; i < 100; ++i) {
+        gpio_put(LED_PIN, 1);
+        sleep_ms(200);
+        gpio_put(LED_PIN, 0);
+        sleep_ms(200);
+    }
+    
+    return 0;
+}

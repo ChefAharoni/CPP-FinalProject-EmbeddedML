@@ -7,16 +7,6 @@
 #include <ranges>
 #include <format>
 
-// Helper to get the actual builtin code (handles schema v3 compatibility)
-tflite::BuiltinOperator GetActualBuiltinCode(const tflite::OperatorCode* op_code) {
-    if (!op_code) {
-        return tflite::BuiltinOperator_CUSTOM;
-    }
-    return static_cast<tflite::BuiltinOperator>(
-        std::max(static_cast<int>(op_code->builtin_code()),
-                 static_cast<int>(op_code->deprecated_builtin_code())));
-}
-
 // Helper to get operator name from FlatBuffer
 std::string GetOperatorName(const tflite::OperatorCode* op_code) {
     if (!op_code) {
@@ -35,44 +25,6 @@ std::string GetOperatorName(const tflite::OperatorCode* op_code) {
         }
         return result;
     }
-}
-
-// Calculate tensor size from FlatBuffer shape
-std::size_t CalculateTensorSize(const flatbuffers::Vector<int32_t>* shape) {
-    if (!shape || shape->size() == 0) {
-        return 1;
-    }
-    
-    auto shape_view = std::ranges::views::iota(0u, shape->size())
-        | std::ranges::views::transform([shape](std::size_t i) {
-            return static_cast<std::size_t>(shape->Get(i));
-        });
-    
-    return std::accumulate(shape_view.begin(), shape_view.end(), 
-                          std::size_t{1}, std::multiplies<>{});
-}
-
-// Get shape as string from FlatBuffer
-std::string GetShapeString(const flatbuffers::Vector<int32_t>* shape) {
-    if (!shape || shape->size() == 0) {
-        return "1";
-    }
-    
-    auto shape_strs = std::ranges::views::iota(0u, shape->size())
-        | std::ranges::views::transform([shape](std::size_t i) {
-            return std::to_string(shape->Get(i));
-        });
-    
-    std::string result;
-    bool first = true;
-    for (const auto& str : shape_strs) {
-        if (!first) {
-            result += ", ";
-        }
-        result += str;
-        first = false;
-    }
-    return result;
 }
 
 // Escape identifier for C++
