@@ -14,14 +14,14 @@ public:
     static constexpr size_t kInputSize = {{ input_size }};
     static constexpr size_t kOutputSize = {{ output_size }};
 
-{% if intermediate_buffers|length > 0 %}
+{%- if intermediate_buffers|length > 0 %}
 private:
     // Intermediate buffers for layer outputs
 {% for buffer in intermediate_buffers %}
     static float buffer_{{ buffer.index }}[{{ buffer.size }}];
-{% endfor %}
+{%- endfor %}
 
-{% endif %}
+{%- endif %}
 public:
     // Run inference on input data
     // input: array of size kInputSize

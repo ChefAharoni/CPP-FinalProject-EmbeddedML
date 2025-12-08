@@ -15,6 +15,6 @@ static const float {{ weight.var_name }}[{{ weight.num_elements }}] = {
 {% endif %}{% endfor %}
 };
 
-{% endfor %}
+{%- endfor %}
 } // namespace embedded_ml
 

@@ -14,6 +14,8 @@
 #include <iterator>
 #include <format>
 #include <stdexcept>
+#include <cctype>
+#include <ranges>
 
 void GenerateWeightsFile(
     const std::string& output_path,
@@ -143,12 +145,14 @@ void GenerateModelHeader(
     inja::Environment env;
     
     std::string guard_name = base_name;
-    std::transform(guard_name.begin(), guard_name.end(), guard_name.begin(), ::toupper);
-    for (std::size_t i = 0; i < guard_name.length(); ++i) {
-        if (guard_name[i] == '-' || guard_name[i] == '.') {
-            guard_name[i] = '_';
-        }
-    }
+    // Transform to uppercase and replace invalid characters in one pass
+    std::ranges::transform(guard_name, guard_name.begin(),
+        [](char c) -> char {
+            if (c == '-' || c == '.') {
+                return '_';
+            }
+            return static_cast<char>(std::toupper(static_cast<unsigned char>(c)));
+        });
     guard_name += "_MODEL_H";
     
     nlohmann::json data;

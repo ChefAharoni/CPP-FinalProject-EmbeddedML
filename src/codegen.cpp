@@ -27,7 +27,10 @@
 // Helper function to parse inference type from string (case-insensitive)
 InferenceType ParseInferenceType(const std::string& str) {
     std::string lower_str = str;
-    std::transform(lower_str.begin(), lower_str.end(), lower_str.begin(), ::tolower);
+    std::ranges::transform(lower_str, lower_str.begin(),
+        [](char c) -> char {
+            return static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+        });
     
     if (lower_str == "none") {
         return InferenceType::None;

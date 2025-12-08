@@ -5,36 +5,36 @@
 #include "{{ base_name }}.h"
 #include "{{ base_name }}_weights.cpp"
 #include "components/fully_connected.h"
-{% if has_standalone_relu %}
+{%- if has_standalone_relu %}
 #include "components/relu.h"
-{% endif %}
-{% if has_conv2d %}
+{%- endif %}
+{%- if has_conv2d %}
 #include "components/conv_2d.h"
-{% endif %}
-{% if has_max_pool2d %}
+{%- endif %}
+{%- if has_max_pool2d %}
 #include "components/max_pool_2d.h"
-{% endif %}
-{% if has_shape %}
+{%- endif %}
+{%- if has_shape %}
 #include "components/shape.h"
-{% endif %}
-{% if has_strided_slice %}
+{%- endif %}
+{%- if has_strided_slice %}
 #include "components/strided_slice.h"
-{% endif %}
-{% if has_pack %}
+{%- endif %}
+{%- if has_pack %}
 #include "components/pack.h"
-{% endif %}
-{% if has_reshape %}
+{%- endif %}
+{%- if has_reshape %}
 #include "components/reshape.h"
-{% endif %}
-{% if has_add %}
+{%- endif %}
+{%- if has_add %}
 #include "components/add.h"
-{% endif %}
-{% if has_dropout %}
+{%- endif %}
+{%- if has_dropout %}
 #include "components/dropout.h"
-{% endif %}
-{% if has_flatten %}
+{%- endif %}
+{%- if has_flatten %}
 #include "components/flatten.h"
-{% endif %}
+{%- endif %}
 #include "components/softmax.h"
 #include <cstddef>
 
@@ -43,29 +43,29 @@ namespace embedded_ml {
 void {{ base_name }}Model::Inference(const float* input, float* output) {
 {% for layer in layers %}
     // Layer {{ layer.index }}: {{ layer.op_name }}
-{% if layer.op_name == "FULLY_CONNECTED" %}
+{%- if layer.op_name == "FULLY_CONNECTED" %}
     FullyConnected({{ layer.input_ptr }}, {{ layer.weights_var }}, {{ layer.bias_var }}, {{ layer.output_ptr }}, {{ layer.fc_input_size }}, {{ layer.output_size }}, {{ layer.activation_param }});
-{% else %}
-{% if layer.op_name == "RELU" %}
+{%- else -%}
+{%- if layer.op_name == "RELU" %}
     ReLU({{ layer.input_ptr }}, {{ layer.output_ptr }}, {{ layer.output_size }});
-{% else %}
-{% if layer.op_name == "SOFTMAX" %}
+{%- else -%}
+{%- if layer.op_name == "SOFTMAX" %}
     Softmax({{ layer.input_ptr }}, {{ layer.output_ptr }}, {{ layer.output_size }});
-{% else %}
-{% if layer.op_name == "CONV_2D" %}
+{%- else -%}
+{%- if layer.op_name == "CONV_2D" %}
     Conv2D({{ layer.input_ptr }}, {{ layer.filter_var }}, {{ layer.bias_var }}, {{ layer.output_ptr }}, {{ layer.batch_size }}, {{ layer.input_height }}, {{ layer.input_width }}, {{ layer.input_channels }}, {{ layer.filter_height }}, {{ layer.filter_width }}, {{ layer.output_channels }}, {{ layer.stride_height }}, {{ layer.stride_width }}, {{ layer.padding_param }}, {{ layer.activation_param }}, {{ layer.dilation_height }}, {{ layer.dilation_width }});
-{% else %}
-{% if layer.op_name == "MAX_POOL_2D" %}
+{%- else -%}
+{%- if layer.op_name == "MAX_POOL_2D" %}
     MaxPool2D({{ layer.input_ptr }}, {{ layer.output_ptr }}, {{ layer.batch_size }}, {{ layer.input_height }}, {{ layer.input_width }}, {{ layer.channels }}, {{ layer.filter_height }}, {{ layer.filter_width }}, {{ layer.stride_height }}, {{ layer.stride_width }}, {{ layer.padding_param }}, {{ layer.activation_param }});
-{% else %}
-{% if layer.op_name == "SHAPE" %}
+{%- else -%}
+{%- if layer.op_name == "SHAPE" %}
     // SHAPE: Extract shape from input tensor
     {
         int32_t input_shape[{{ layer.num_dims }}] = { {{ layer.shape_values }} };
         Shape(input_shape, {{ layer.num_dims }}, reinterpret_cast<int32_t*>({{ layer.output_ptr }}));
     }
-{% else %}
-{% if layer.op_name == "STRIDED_SLICE" %}
+{%- else -%}
+{%- if layer.op_name == "STRIDED_SLICE" %}
     // STRIDED_SLICE: Extract slice from input
     // Note: This is a simplified implementation
     // Full implementation would extract begin/end/strides from input tensors
@@ -73,8 +73,8 @@ void {{ base_name }}Model::Inference(const float* input, float* output) {
     for (size_t j = 0; j < {{ layer.output_size }}; ++j) {
         {{ layer.output_ptr }}[j] = {{ layer.input_ptr }}[j];
     }
-{% else %}
-{% if layer.op_name == "PACK" %}
+{%- else -%}
+{%- if layer.op_name == "PACK" %}
     // PACK: Pack multiple inputs along axis {{ layer.axis }}
     // Note: This is a simplified implementation
     // Full implementation would handle multiple input tensors
@@ -82,41 +82,40 @@ void {{ base_name }}Model::Inference(const float* input, float* output) {
     for (size_t j = 0; j < {{ layer.output_size }}; ++j) {
         {{ layer.output_ptr }}[j] = {{ layer.input_ptr }}[j];
     }
-{% else %}
-{% if layer.op_name == "RESHAPE" %}
+{%- else -%}
+{%- if layer.op_name == "RESHAPE" %}
     Reshape({{ layer.input_ptr }}, {{ layer.input_size }}, {{ layer.output_ptr }}, {{ layer.output_size }});
-{% else %}
-{% if layer.op_name == "ADD" %}
+{%- else -%}
+{%- if layer.op_name == "ADD" %}
     Add({{ layer.input1_ptr }}, {{ layer.input2_ptr }}, {{ layer.output_ptr }}, {{ layer.add_size }}, {{ layer.activation_param }});
-{% else %}
-{% if layer.op_name == "DROPOUT" %}
+{%- else -%}
+{%- if layer.op_name == "DROPOUT" %}
     // DROPOUT: No-op during inference (passes through input)
     Dropout({{ layer.input_ptr }}, {{ layer.output_ptr }}, {{ layer.output_size }}, {{ layer.dropout_rate }}f);
-{% else %}
-{% if layer.op_name == "FLATTEN" %}
+{%- else -%}
+{%- if layer.op_name == "FLATTEN" %}
     // FLATTEN: Flatten multi-dimensional tensor to 1D
     Flatten({{ layer.input_ptr }}, {{ layer.input_size }}, {{ layer.output_ptr }}, {{ layer.output_size }});
-{% endif %}
-{% endif %}
-{% endif %}
-{% endif %}
-{% endif %}
-{% endif %}
-{% endif %}
-{% endif %}
-{% endif %}
-{% endif %}
-{% endif %}
-{% endif %}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
+{%- endif -%}
 {% endfor %}
 }
 
-{% if intermediate_buffers|length > 0 %}
+{%- if intermediate_buffers|length > 0 %}
 // Intermediate buffer definitions
 {% for buffer in intermediate_buffers %}
 float {{ base_name }}Model::buffer_{{ buffer.index }}[{{ buffer.size }}];
-
-{% endfor %}
-{% endif %}
+{%- endfor %}
+{%- endif %}
 } // namespace embedded_ml
 
